@@ -1,0 +1,34 @@
+---
+description: 每个 CLI 需在 cli-tests/ 中有对应测试；改 CLI 或 public API 后须跑测并更新测试
+globs: cli/**/*.py,cli-tests/**/*.py,llm_from_scratch/**/*.py
+alwaysApply: false
+---
+
+# CLI 与 cli-tests 同步
+
+## 必须遵守
+
+1. **`cli/` 下每个可执行入口**（每个 `*_cli.py` 或约定好的 CLI 脚本）在 **`cli-tests/`** 中须有 **对应测试模块**，命名与 CLI 路径对齐，便于一一映射。  
+   例：`cli/llm_from_scratch/bpe_tokenizer/BPETokenizer_cli.py` → `cli-tests/llm_from_scratch/bpe_tokenizer/test_BPETokenizer_cli.py`（或同级结构的 `test_*_cli.py`）。
+
+2. **测试范围**：不仅对「成功路径」断言，还须覆盖 **边界与失败场景**，例如：  
+   - 缺参、非法参数、`--help` 可运行  
+   - 不存在文件路径、空输入（若适用）  
+   - 与所调用的 **public 方法** 行为变更相关的输出/退出码
+
+3. **变更流程**：修改 **`cli/`** 或其所依赖的 **public 方法** 后，必须：  
+   - **运行** `cli-tests`（如 `uv run pytest cli-tests` 或项目统一命令）  
+   - **修复** 实现或 **更新** 测试期望，使套件在修改后仍全部通过。
+
+4. **禁止**：只改 CLI / 业务代码而不跑、不更新 `cli-tests`，导致入口脚本无自动化回归。
+
+## 实现建议
+
+- 用 **`pytest`** + **`subprocess`** 或 **`click.testing.CliRunner`**（若 CLI 用 Click）调用 CLI，检查 **stdout/stderr/returncode**。  
+- 对需要临时文件的用例使用 **`tmp_path`** fixture，避免污染仓库。
+
+## 自检清单
+
+- [ ] 新增的 CLI 是否在 `cli-tests/` 中有对应文件？  
+- [ ] 是否包含至少一条失败/边界用例？  
+- [ ] 本次改动是否已本地执行完整 `cli-tests` 并通过？

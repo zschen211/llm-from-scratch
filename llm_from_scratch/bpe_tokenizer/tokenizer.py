@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 # token_ids_v?.json 所在目录：项目根目录下的 tokenizer 文件夹
-_TOKENIZER_DIR = Path(__file__).resolve().parent.parent.parent / "tokenizer"
+# 测试可通过环境变量 LLM_FS_TOKENIZER_DIR 指向临时目录，避免污染仓库 tokenizer/
+_DEFAULT_TOKENIZER_DIR = Path(__file__).resolve().parent.parent.parent / "tokenizer"
+_TOKENIZER_DIR = Path(os.environ.get("LLM_FS_TOKENIZER_DIR", _DEFAULT_TOKENIZER_DIR))
 
 
 class TextFileDataLoader:
@@ -218,33 +220,3 @@ class BPETokenizerTrainer:
     def __len__(self) -> int:
         """训练文件总字节数（委托给 loader）。"""
         return len(self._loader)
-
-
-def _find_tinystories_in_data() -> Path:
-    """在 data 目录下查找 TinyStories 相关文件。"""
-    data_dir = Path("data")
-    if not data_dir.is_dir():
-        raise FileNotFoundError(f"data 目录不存在: {data_dir}")
-    candidates = list(data_dir.glob("*[Tt]iny*[Ss]tories*.txt"))
-    if not candidates:
-        raise FileNotFoundError(f"在 {data_dir} 下未找到 TinyStories 文本文件")
-    return candidates[0]
-
-
-def main() -> None:
-    tinystories_path = _find_tinystories_in_data()
-    print(f"使用文件: {tinystories_path}")
-
-    with BPETokenizerTrainer(tinystories_path, n_processes=1) as trainer:
-        tokenizer = trainer.tokenizer
-        chunk_size = 8192  # 每次读 8KB
-        chunk = trainer.read_chunk(chunk_size)
-        fragments = tokenizer.pretokenize(chunk)
-
-        print(f"读取 {len(chunk)} 个字符，pretokenize 得到 {len(fragments)} 个片段")
-        print("前 20 个片段(原始):", fragments[:20])
-        print("vocab 长度:", len(tokenizer.vocab))
-
-
-if __name__ == "__main__":
-    main()

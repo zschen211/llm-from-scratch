@@ -1,0 +1,35 @@
+---
+description: 每个 public 方法需有对应 CLI；CLI 放在 cli/ 下并按包名+类名组织
+globs: llm_from_scratch/**/*.py,cli/**/*.py
+alwaysApply: false
+---
+
+# Public API 与 CLI 同步
+
+## 必须遵守
+
+1. **每个对外暴露的 public 方法**（模块级函数或类上无下划线前缀的方法）在合并代码前，都应有 **可直接调用的 CLI**，用于手动验证该行为。
+2. **修改 public 方法**（签名、语义、副作用）时，**同一 PR / 提交内**须同步更新对应 CLI（参数、帮助文案、示例）。
+3. **CLI 根目录**：项目根下的 `cli/`（勿放在包内 `llm_from_scratch/` 下）。
+
+## 目录与命名（package + class）
+
+- 按 **Python 包路径**建子目录，与 `llm_from_scratch` 下包结构一致。  
+  例：`llm_from_scratch.bpe_tokenizer.tokenizer` → `cli/llm_from_scratch/bpe_tokenizer/`
+- **按类区分文件**：同一模块多个 public 类时，每个类一个 CLI 文件，命名：  
+  **`<ClassName>_cli.py`**（PascalCase 类名 + `_cli` 后缀）。  
+  例：`BPETokenizer` → `cli/llm_from_scratch/bpe_tokenizer/BPETokenizer_cli.py`
+- **仅模块级 public 函数、无主要类**时：使用 **`<module>_cli.py`**，与源模块名一致。  
+  例：`train_bpe` 在 `bpe_train.py` → `bpe_train_cli.py`
+
+## CLI 实现要点
+
+- 使用 **`if __name__ == "__main__"`** 或 **`argparse` / `click`** 等，保证 `python path/to/xxx_cli.py ...` 可运行。
+- 在 **docstring 或 `--help`** 中说明与哪个 public 方法对应，便于审计。
+- 优先 **import 正式包**（如 `from llm_from_scratch...`），避免复制业务逻辑。
+
+## 自检清单
+
+- [ ] 新增的每个 public 方法是否能在 `cli/` 中找到对应入口？
+- [ ] 修改 public 签名后，`cli/` 下脚本是否仍能通过 `--help` 且调用成功？
+- [ ] 每个 CLI 是否在 `cli-tests/` 中有对应测试并覆盖边界？（见规则 `cli-tests.mdc`）
