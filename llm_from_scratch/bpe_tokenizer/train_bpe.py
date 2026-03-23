@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import multiprocessing as _mp
 import os
+import pickle
+import shutil
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -110,10 +113,24 @@ def _preprocess_and_pretokenize_training_text(
         # 收集并按 chunk_id 拼回
         chunk_out: list[list[list[bytes]] | None] = [None] * chunk_tasks
         chunk_counts: list[int] = [0] * chunk_tasks
+        pretok_done_chunks = 0
+        pretok_count_done = 0
         for _ in range(chunk_tasks):
             chunk_id, out_words, c = res_q.get()
             chunk_out[int(chunk_id)] = out_words
             chunk_counts[int(chunk_id)] = int(c)
+            pretok_done_chunks += 1
+            pretok_count_done += int(c)
+            if callable(metrics_callback):
+                metrics_callback(
+                    {
+                        "event": "pretok_progress",
+                        "stage": "data_pretokenization",
+                        "done_chunks": pretok_done_chunks,
+                        "total_chunks": chunk_tasks,
+                        "pretok_count_done": pretok_count_done,
+                    }
+                )
 
         for p in workers:
             try:
@@ -632,6 +649,148 @@ _PARALLEL_WORD_THRESHOLD = 5000
 _PRETOK_PARALLEL_SEGMENTS_THRESHOLD = 5000
 
 
+def _read_next_text_batch(
+    input_path: Path,
+    start_pos: int,
+    chunk_chars: int,
+    batch_chunks: int,
+) -> tuple[str, int, int]:
+    """从 `start_pos` 开始读取一个 batch（含多个 chunk）。"""
+    with open(input_path, "r", encoding="utf-8") as f:
+        f.seek(start_pos)
+        parts: list[str] = []
+        chunks_read = 0
+        for _ in range(max(1, batch_chunks)):
+            s = f.read(max(1, chunk_chars))
+            if not s:
+                break
+            parts.append(s)
+            chunks_read += 1
+        return "".join(parts), f.tell(), chunks_read
+
+
+def _find_chunk_boundaries_by_special_token(
+    input_path: Path,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    按 special token 对齐 chunk 边界，避免硬切分造成 pretokenize 上下文不一致。
+    返回字节偏移边界列表（含 0 与 file_size）。
+    """
+    desired_num_chunks = max(1, desired_num_chunks)
+    with open(input_path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        f.seek(0)
+        if file_size <= 0:
+            return [0]
+
+        chunk_size = max(1, file_size // desired_num_chunks)
+        boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+        boundaries[-1] = file_size
+
+        mini_chunk_size = 4096
+        for bi in range(1, len(boundaries) - 1):
+            initial_position = boundaries[bi]
+            f.seek(initial_position)
+            while True:
+                mini = f.read(mini_chunk_size)
+                if mini == b"":
+                    boundaries[bi] = file_size
+                    break
+                found_at = mini.find(split_special_token)
+                if found_at != -1:
+                    boundaries[bi] = initial_position + found_at
+                    break
+                initial_position += mini_chunk_size
+
+        # 去重后可能少于 desired_num_chunks，这是预期行为。
+        return sorted(set(boundaries))
+
+
+def _dump_words_chunk(path: Path, words: list[list[bytes]]) -> None:
+    with open(path, "wb") as f:
+        pickle.dump(words, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _load_words_chunk(path: Path) -> list[list[bytes]]:
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    return data
+
+
+def _get_system_memory_percent() -> float | None:
+    """返回系统内存占用百分比；不可用时返回 None。
+
+    优先使用 psutil；不可用时 fallback 到 /proc/meminfo（Linux / WSL2）。
+    """
+    try:
+        import psutil
+
+        return float(psutil.virtual_memory().percent)
+    except Exception:
+        pass
+
+    try:
+        info: dict[str, int] = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0].rstrip(":")
+                    info[key] = int(parts[1])
+        total = info.get("MemTotal", 0)
+        available = info.get("MemAvailable", 0)
+        if total > 0:
+            return 100.0 * (1.0 - available / total)
+    except Exception:
+        pass
+
+    return None
+
+
+def _force_release_memory() -> None:
+    """强制触发 GC 并尝试让 glibc 把空闲页归还操作系统。"""
+    import gc
+
+    gc.collect()
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _load_chunk_batch(
+    chunk_files: list[Path],
+    start_idx: int,
+    memory_target_percent: float,
+) -> tuple[list[tuple[Path, list[list[bytes]]]], int]:
+    """
+    从 *start_idx* 开始顺序加载 chunk 文件到内存，
+    直到系统内存占用率 >= *memory_target_percent* 或所有 chunk 都已加载。
+    至少加载一个 chunk 以保证进度。
+
+    返回 (loaded_list, next_start_idx)。
+    loaded_list 保持文件原始顺序: [(path, words), ...]。
+    """
+    loaded: list[tuple[Path, list[list[bytes]]]] = []
+    idx = start_idx
+    while idx < len(chunk_files):
+        if loaded:
+            mem = _get_system_memory_percent()
+            if mem is not None and mem >= memory_target_percent:
+                break
+        path = chunk_files[idx]
+        words = _load_words_chunk(path)
+        loaded.append((path, words))
+        idx += 1
+    return loaded, idx
+
+
 def train_bpe(
     input_path: str | os.PathLike[str],
     vocab_size: int,
@@ -650,6 +809,12 @@ def train_bpe(
             metrics_callback(metrics: dict[str, Any])。
         profile_dir: 可选；若提供目录路径，使用 cProfile 对训练全程采样并将
             .prof 文件写入该目录（文件名含时间戳与 PID）。
+        stream_chunk_chars: 流式读取时每次从文件中读取的字符数（默认 1_000_000）。
+            > 0 时启用流式读取；设为 0 禁用流式，回退到一次性 read_text 模式。
+        stream_memory_target_percent: 外存模式内存占用率阈值（默认 85）。
+            pretokenize 阶段累积的 words 在内存占用率达到该阈值时落盘为一个 chunk 文件；
+            merge 阶段分批加载 chunk 文件时也以此阈值为界。
+            chunk 数量完全由数据大小和可用内存动态决定。
     """
     input_path = Path(input_path)
     if not kwargs.get("disable_packaged_regression"):
@@ -665,12 +830,272 @@ def train_bpe(
         _profiler = cProfile.Profile()
         _profiler.enable()
 
-    text = input_path.read_text(encoding="utf-8")
-
     checkpoint_path = kwargs.get("checkpoint_path")
     force_restart = bool(kwargs.get("force_restart", False))
 
     metrics_callback: Callable[[dict[str, Any]], None] | None = kwargs.get("metrics_callback")
+    stream_chunk_chars = int(kwargs.get("stream_chunk_chars", 1_000_000) or 1_000_000)
+
+    if stream_chunk_chars > 0:
+
+        # 外存多遍扫描：
+        # 1) 顺序读取文件，每次读取 stream_chunk_chars 字符并按 special token
+        #    对齐，pretokenize 后累积到内存；内存占用达阈值时落盘为一个 chunk 文件。
+        # 2) 每轮 merge 分批加载 chunk 文件统计 pair，再分批回写 merged chunk。
+        pretok_num_workers = kwargs.get("num_workers")
+        if pretok_num_workers is None:
+            pretok_num_workers = (os.cpu_count() or 1) + 1
+
+        checkpoint_path = kwargs.get("checkpoint_path")
+        force_restart = bool(kwargs.get("force_restart", False))
+        ckpt = Path(checkpoint_path) if checkpoint_path else None
+        if ckpt and not force_restart and ckpt.is_file():
+            raise ValueError(
+                "Streaming mode does not support checkpoint resume yet; "
+                "set force_restart=True or disable streaming (stream_chunk_chars=0)."
+            )
+
+        vocab = _build_initial_vocab(special_tokens)
+        merges: list[tuple[bytes, bytes]] = []
+        next_id = len(vocab)
+        merges_target = max(0, vocab_size - len(vocab))
+
+        workdir = Path(
+            kwargs.get(
+                "stream_workdir",
+                Path(tempfile.gettempdir()) / f"train_bpe_stream_{os.getpid()}_{int(time.time())}",
+            )
+        )
+        chunks_dir = workdir / "chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        chunk_files: list[Path] = []
+        memory_target_percent = float(kwargs.get("stream_memory_target_percent", 85) or 85)
+        split_special = max(special_tokens, key=len, default="<|endoftext|>")
+        file_size = input_path.stat().st_size
+
+        try:
+            if callable(metrics_callback):
+                metrics_callback({"event": "stage_start", "stage": "data_pretokenization"})
+            pretok_total_t0 = time.perf_counter()
+            pretok_total_count = 0
+            chunk_index = 0
+            accumulated_words: list[list[bytes]] = []
+
+            with open(input_path, "r", encoding="utf-8") as f:
+                carry = ""
+                while True:
+                    # 在读取+pretokenize 之前检查内存，避免在高水位下执行重操作
+                    if accumulated_words:
+                        mem = _get_system_memory_percent()
+                        if mem is not None and mem >= memory_target_percent:
+                            chunk_index += 1
+                            cpath = chunks_dir / f"chunk_{chunk_index:06d}.pkl"
+                            _dump_words_chunk(cpath, accumulated_words)
+                            chunk_files.append(cpath)
+                            accumulated_words = []
+                            _force_release_memory()
+
+                    raw = f.read(stream_chunk_chars)
+                    if not raw and not carry:
+                        break
+
+                    if raw:
+                        text = carry + raw
+                        last_sp = text.rfind(split_special)
+                        if last_sp != -1:
+                            cut = last_sp + len(split_special)
+                            if cut < len(text):
+                                carry = text[cut:]
+                                text = text[:cut]
+                            else:
+                                carry = ""
+                        else:
+                            carry = ""
+                    else:
+                        text = carry
+                        carry = ""
+
+                    if not text:
+                        continue
+
+                    words_part = _preprocess_and_pretokenize_training_text(
+                        text,
+                        special_tokens,
+                        metrics_callback=None,
+                        num_workers=int(pretok_num_workers),
+                    )
+                    accumulated_words.extend(words_part)
+                    pretok_total_count += len(words_part)
+
+                    if callable(metrics_callback):
+                        bytes_read = f.tell()
+                        metrics_callback(
+                            {
+                                "event": "pretok_progress",
+                                "stage": "data_pretokenization",
+                                "bytes_read": bytes_read,
+                                "file_size": file_size,
+                                "pretok_count_done": pretok_total_count,
+                            }
+                        )
+
+            if accumulated_words:
+                chunk_index += 1
+                cpath = chunks_dir / f"chunk_{chunk_index:06d}.pkl"
+                _dump_words_chunk(cpath, accumulated_words)
+                chunk_files.append(cpath)
+                accumulated_words = []
+
+            if callable(metrics_callback):
+                metrics_callback(
+                    {
+                        "event": "stage_end",
+                        "stage": "data_pretokenization",
+                        "metrics": {
+                            "pretok_count": pretok_total_count,
+                            "pretok_ms": 1000.0 * (time.perf_counter() - pretok_total_t0),
+                        },
+                    }
+                )
+
+            cumulative_iter_wall_ms = 0.0
+            merge_iters_executed = 0
+            if callable(metrics_callback):
+                metrics_callback(
+                    {"event": "stage_start", "stage": "byte_pair_merge_iter", "merges_target": merges_target}
+                )
+
+            # 尝试一次性加载全部 chunk 到内存；装得下则全程内存操作，
+            # 装不下则退回每轮 merge 分批读写磁盘的模式。
+            first_batch, first_next = _load_chunk_batch(
+                chunk_files, 0, memory_target_percent,
+            )
+            all_in_memory = first_next >= len(chunk_files)
+
+            pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+
+            if all_in_memory:
+                # 快速路径：全部 chunk 驻留内存，merge 期间零磁盘 I/O。
+                resident_chunks: list[list[list[bytes]]] = [w for _, w in first_batch]
+                del first_batch
+                for words_chunk in resident_chunks:
+                    pair_counts.update(_count_pairs(words_chunk))
+            else:
+                # 慢速路径：先用首批统计，再继续分批加载剩余 chunk。
+                for _cpath, words_chunk in first_batch:
+                    pair_counts.update(_count_pairs(words_chunk))
+                del first_batch
+                _force_release_memory()
+                batch_start = first_next
+                while batch_start < len(chunk_files):
+                    batch, batch_start = _load_chunk_batch(
+                        chunk_files, batch_start, memory_target_percent,
+                    )
+                    for _cpath, words_chunk in batch:
+                        pair_counts.update(_count_pairs(words_chunk))
+                    del batch
+                    _force_release_memory()
+
+            while len(vocab) < vocab_size:
+                iter_no = len(merges) + 1
+                iter_t0 = time.perf_counter()
+
+                if not pair_counts:
+                    break
+
+                left, right = _pick_pair_to_merge(pair_counts)
+                merged = left + right
+                merges.append((left, right))
+                vocab[next_id] = merged
+                next_id += 1
+
+                iter_delta: dict[tuple[bytes, bytes], int] = {}
+
+                if all_in_memory:
+                    for words_chunk in resident_chunks:
+                        delta = _merge_pair_all_words_with_pair_deltas(
+                            words_chunk, left, right, merged,
+                        )
+                        for p, d in delta.items():
+                            iter_delta[p] = iter_delta.get(p, 0) + d
+                else:
+                    batch_start = 0
+                    while batch_start < len(chunk_files):
+                        batch, batch_start = _load_chunk_batch(
+                            chunk_files, batch_start, memory_target_percent,
+                        )
+                        for cpath, words_chunk in batch:
+                            delta = _merge_pair_all_words_with_pair_deltas(
+                                words_chunk, left, right, merged,
+                            )
+                            for p, d in delta.items():
+                                iter_delta[p] = iter_delta.get(p, 0) + d
+                            _dump_words_chunk(cpath, words_chunk)
+                        del batch
+                        _force_release_memory()
+
+                for p, d in iter_delta.items():
+                    new_v = pair_counts.get(p, 0) + d
+                    if new_v > 0:
+                        pair_counts[p] = new_v
+                    else:
+                        pair_counts.pop(p, None)
+
+                if ckpt:
+                    _save_checkpoint(ckpt, vocab, merges)
+
+                iter_wall_ms = 1000.0 * (time.perf_counter() - iter_t0)
+                cumulative_iter_wall_ms += iter_wall_ms
+                merge_iters_executed += 1
+                avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed
+
+                if callable(metrics_callback):
+                    metrics_callback(
+                        {
+                            "event": "merge_iter_end",
+                            "merge_iter": iter_no,
+                            "count": None,
+                            "merge": None,
+                            "iter_wall_ms": iter_wall_ms,
+                            "avg_merge_wall_ms": avg_merge_wall_ms,
+                            "avg_merge_consumer_task_ms": iter_wall_ms,
+                            "merges_done": iter_no,
+                            "merges_target": merges_target,
+                        }
+                    )
+
+            if callable(metrics_callback):
+                final_avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed if merge_iters_executed else 0.0
+                metrics_callback(
+                    {
+                        "event": "stage_end",
+                        "stage": "byte_pair_merge_iter",
+                        "metrics": {
+                            "total_merges_executed": merge_iters_executed,
+                            "total_iter_wall_ms": cumulative_iter_wall_ms,
+                            "avg_merge_wall_ms": final_avg_merge_wall_ms,
+                        },
+                    }
+                )
+
+            if _profiler is not None:
+                _profiler.disable()
+                _prof_dir = Path(profile_dir)  # type: ignore[arg-type]
+                _prof_dir.mkdir(parents=True, exist_ok=True)
+                _prof_file = _prof_dir / f"train_bpe_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.prof"
+                _profiler.dump_stats(str(_prof_file))
+                if callable(metrics_callback):
+                    metrics_callback({"event": "profile_saved", "path": str(_prof_file)})
+
+            return vocab, merges
+        finally:
+            if kwargs.get("stream_keep_workdir"):
+                pass
+            else:
+                shutil.rmtree(workdir, ignore_errors=True)
+    else:
+        text = input_path.read_text(encoding="utf-8")
 
     # 预处理 + 预分词阶段（可观测性埋点在 helper 内输出 stage_start/stage_end）
     # 注意：这里复用同一个 num_workers 作为预分词的并行 worker 数（小语料会自动回退到串行，避免启动开销影响速度）。
@@ -700,6 +1125,7 @@ def train_bpe(
         next_id = len(vocab)
 
     remaining = vocab_size - len(vocab)
+    merges_target = remaining
     num_workers = kwargs.get("num_workers")
     if num_workers is None:
         num_workers = (os.cpu_count() or 1) + 1
@@ -723,7 +1149,9 @@ def train_bpe(
     merge_iters_executed = 0
 
     if callable(metrics_callback):
-        metrics_callback({"event": "stage_start", "stage": "byte_pair_merge_iter"})
+        metrics_callback(
+            {"event": "stage_start", "stage": "byte_pair_merge_iter", "merges_target": merges_target}
+        )
 
     if use_parallel:
         try:
@@ -763,6 +1191,8 @@ def train_bpe(
                             "iter_wall_ms": iter_wall_ms,
                             "avg_merge_wall_ms": avg_merge_wall_ms,
                             "avg_merge_consumer_task_ms": merge_metrics["consumer_avg_task_ms"],
+                            "merges_done": iter_no,
+                            "merges_target": merges_target,
                         }
                     )
         finally:
@@ -821,6 +1251,8 @@ def train_bpe(
                         "iter_wall_ms": iter_wall_ms,
                         "avg_merge_wall_ms": avg_merge_wall_ms,
                         "avg_merge_consumer_task_ms": merge_ms,
+                        "merges_done": iter_no,
+                        "merges_target": merges_target,
                     }
                 )
 

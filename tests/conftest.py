@@ -3,8 +3,15 @@ import numpy as np
 import pytest
 import os
 from pathlib import Path
-import torch
-from torch import Tensor
+try:
+    import torch
+    from torch import Tensor
+except ModuleNotFoundError:  # pragma: no cover
+    # Allow running tokenizer/BPE unit tests without installing the full torch stack.
+    torch = None  # type: ignore[assignment]
+
+    class Tensor:  # type: ignore[no-redef]
+        pass
 import pickle
 
 

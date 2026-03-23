@@ -4,7 +4,7 @@
 
 1. `train_bpe_cli.py`：训练 vocab/merges 并写出 checkpoint JSON
 2. `bpe_tokenizer_cli.py`：基于 checkpoint（或 GPT-2 vocab/merges）执行 `encode` / `decode` / `encode_iterable`
-3. `train_bpe_flamegraph_cli.py`：将训练产生的 `.prof` 文件转换为 SVG 火焰图
+3. `train_bpe_flamegraph_cli.py`：将训练产生的 `.prof` 文件转换为 HTML 火焰图
 
 ## 1) 训练：`train_bpe_cli.py`
 
@@ -34,6 +34,24 @@ python cli/llm_from_scratch/bpe_tokenizer/train_bpe_cli.py \
 | `--force-restart` | 忽略已有 checkpoint，强制重新训练 |
 | `--profile` | 启用 cProfile 性能采样，`.prof` 文件默认写入 `.prof/` 目录 |
 | `--profile-dir DIR` | 自定义 `.prof` 输出目录（隐式启用 `--profile`） |
+| `--stream-chunk-chars` | 流式读取每次 I/O 的字符数（默认 `1000000`）；设为 `0` 可关闭并回退为一次性读入 |
+| `--stream-memory-target-percent` | 流式模式下内存占用率阈值（默认 `85`），chunk 文件数量由此动态决定 |
+
+### 流式读取模式
+
+默认启用。训练流程分为两个阶段：
+
+1. **Pretokenize**：顺序读取文件（每次 `--stream-chunk-chars` 字符），按 special token 对齐后 pretokenize，
+   结果累积在内存中；当系统内存占用率达到 `--stream-memory-target-percent` 时，自动将累积数据落盘为一个 chunk 文件。
+   chunk 数量完全由数据大小和可用内存动态决定，无需手动指定。
+
+2. **Merge**：尝试一次性加载所有 chunk 文件到内存（快速路径）；若装不下，则按内存阈值分批加载、处理、写回。
+
+若要回退到旧的一次性读入模式：
+
+```bash
+--stream-chunk-chars 0
+```
 
 ### 性能分析（Profiling）
 
@@ -57,6 +75,57 @@ python cli/llm_from_scratch/bpe_tokenizer/train_bpe_cli.py \
 ```
 
 `.prof/` 目录已加入 `.gitignore`，不会被提交。
+
+### 推荐参数模板
+
+下面给出可直接复制的经验参数（按语料规模分档）：
+
+#### 小语料（< 100 MB）
+
+目标：减少额外 I/O，优先简洁。
+
+```bash
+python cli/llm_from_scratch/bpe_tokenizer/train_bpe_cli.py \
+  --input-corpus data/corpus_small.txt \
+  --vocab-size 500 \
+  --special-token "<|endoftext|>" \
+  --out tokenizer/small.json \
+  --stream-chunk-chars 0 \
+  --num-workers 1
+```
+
+#### 中等语料（100 MB ~ 2 GB）
+
+目标：平衡内存占用与训练吞吐。使用默认流式参数即可。
+
+```bash
+python cli/llm_from_scratch/bpe_tokenizer/train_bpe_cli.py \
+  --input-corpus data/corpus_medium.txt \
+  --vocab-size 2000 \
+  --special-token "<|endoftext|>" \
+  --out tokenizer/medium.json \
+  --num-workers 8
+```
+
+#### 大语料（> 2 GB）
+
+目标：严格控制峰值内存。可适当降低内存阈值。
+
+```bash
+python cli/llm_from_scratch/bpe_tokenizer/train_bpe_cli.py \
+  --input-corpus data/corpus_large.txt \
+  --vocab-size 5000 \
+  --special-token "<|endoftext|>" \
+  --out tokenizer/large.json \
+  --stream-memory-target-percent 70 \
+  --num-workers 16 \
+  --profile
+```
+
+> 建议：
+> - 如果机器内存紧张，降低 `--stream-memory-target-percent`（如 `60`），让更多数据尽早落盘。
+> - 如果 CPU 充足且 I/O 不慢，可适当提高 `--num-workers`。
+> - `--profile` 建议只在调优阶段开启，生产跑数可关闭以减少额外开销。
 
 ## 2) 编解码：`bpe_tokenizer_cli.py`
 
@@ -145,4 +214,3 @@ python cli/llm_from_scratch/bpe_tokenizer/train_bpe_flamegraph_cli.py \
   .prof/train_bpe_*.prof \
   --open
 ```
-

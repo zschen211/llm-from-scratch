@@ -191,6 +191,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "regex" },
+    { name = "torch" },
 ]
 
 [package.optional-dependencies]
@@ -213,6 +214,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "regex", specifier = ">=2023.0" },
     { name = "tiktoken", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "torch", specifier = ">=2.10.0" },
     { name = "torch", marker = "extra == 'dev'", specifier = ">=2.0" },
 ]
 provides-extras = ["dev"]

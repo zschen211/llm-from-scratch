@@ -5,8 +5,9 @@
 ## BPE Tokenizer
 
 - 训练并导出 checkpoint：`cli/llm_from_scratch/bpe_tokenizer/train_bpe_cli.py`
+- 默认启用流式读取，chunk 数量由内存阈值自动决定（可用 `--stream-chunk-chars 0` 关闭）
 - 加载并编码/解码：`cli/llm_from_scratch/bpe_tokenizer/bpe_tokenizer_cli.py`
-- 火焰图可视化（`.prof` → SVG）：`cli/llm_from_scratch/bpe_tokenizer/train_bpe_flamegraph_cli.py`
+- 火焰图可视化（`.prof` → HTML）：`cli/llm_from_scratch/bpe_tokenizer/train_bpe_flamegraph_cli.py`
 
 更多示例见：[`docs/cli/bpe_tokenizer.md`](./bpe_tokenizer.md)
 

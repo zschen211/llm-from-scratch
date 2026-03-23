@@ -5,10 +5,20 @@ from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
-import torch
+try:
+    import torch
+    from torch import Tensor
+except ModuleNotFoundError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+
+    class Tensor:  # type: ignore[no-redef]
+        pass
 from llm_from_scratch.bpe_tokenizer import make_tokenizer, train_bpe
-from jaxtyping import Bool, Float, Int
-from torch import Tensor
+try:
+    from jaxtyping import Bool, Float, Int
+except ModuleNotFoundError:  # pragma: no cover
+    # These are only used for type annotations in this repo's test adapters.
+    Bool = Float = Int = Any  # type: ignore[misc,assignment]
 
 
 def run_linear(
