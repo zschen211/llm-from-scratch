@@ -196,17 +196,38 @@ def _merge_pair_all_words_with_pair_deltas(
 
     返回值 delta[pair] 表示合并后 pair 的计数相对合并前的变化量（可为负）。
     """
+    # 局部边界增量：
+    # 1) merge 只会影响“参与合并片段（left,right）相邻”的旧 pair
+    # 2) merge 会在输出流中引入“新 merged token”与其左右邻居的 pair
+    # 由于 merged token 是用 left/right 替换得到的，新 pair 必然是新增的；
+    # 且通过 set 去重可以避免相邻 merge 造成的重复扣减/累加。
     delta: dict[tuple[bytes, bytes], int] = {}
+
     for j in range(len(words)):
         word = words[j]
+        if len(word) < 2:
+            continue
+
         out: list[bytes] = []
+        created_merge_pos: set[int] = set()  # out 中由本次 merge 新产生的 merged token 位置
+        removed_old_pair_indices: set[int] = set()  # 原 word 中将被移除的旧 pair 的索引 i（pair=word[i],word[i+1]）
+
         k = 0
         did_merge = False
-
         while k < len(word):
             if k + 1 < len(word) and word[k] == left and word[k + 1] == right:
-                out.append(merged)
                 did_merge = True
+                # 本次 merge 消耗 word[k] 和 word[k+1]，因此旧 pair 里：
+                # - (word[k-1], word[k]) 以及 (word[k], word[k+1]) 以及 (word[k+1], word[k+2]) 会消失（若存在）
+                if k - 1 >= 0:
+                    removed_old_pair_indices.add(k - 1)
+                removed_old_pair_indices.add(k)  # (left, right)
+                if k + 2 < len(word):
+                    removed_old_pair_indices.add(k + 1)  # (right, next)
+
+                out_pos = len(out)
+                out.append(merged)
+                created_merge_pos.add(out_pos)
                 k += 2
             else:
                 out.append(word[k])
@@ -215,26 +236,30 @@ def _merge_pair_all_words_with_pair_deltas(
         if not did_merge:
             continue
 
-        # 只对发生过合并的 word 做 pair 统计差分，避免无谓的额外开销。
-        before_counts: dict[tuple[bytes, bytes], int] = {}
-        for i in range(len(word) - 1):
+        # 新增的 pair：只需要围绕“本次 merge 新产生的 merged token”更新即可。
+        # 输出相邻 pair 的索引定义为 pair_pos：pair = out[pair_pos], out[pair_pos+1]
+        added_new_pair_positions: set[int] = set()
+        out_len = len(out)
+        for pos in created_merge_pos:
+            if pos - 1 >= 0:
+                added_new_pair_positions.add(pos - 1)
+            if pos < out_len - 1:
+                added_new_pair_positions.add(pos)
+
+        # delta -= old_pairs_removed
+        for i in removed_old_pair_indices:
             p = (word[i], word[i + 1])
-            before_counts[p] = before_counts.get(p, 0) + 1
+            delta[p] = delta.get(p, 0) - 1
 
-        after_counts: dict[tuple[bytes, bytes], int] = {}
-        for i in range(len(out) - 1):
+        # delta += new_pairs_added
+        for i in added_new_pair_positions:
             p = (out[i], out[i + 1])
-            after_counts[p] = after_counts.get(p, 0) + 1
-
-        for p, c in after_counts.items():
-            delta[p] = delta.get(p, 0) + c
-        for p, c in before_counts.items():
-            delta[p] = delta.get(p, 0) - c
+            delta[p] = delta.get(p, 0) + 1
 
         words[j] = out
 
-    # 清理 0 项，保证后续 max(pair_counts.values()) 语义稳定。
     if delta:
+        # 清理 0 项，保证后续逻辑稳定。
         delta = {p: v for p, v in delta.items() if v != 0}
     return delta
 
@@ -279,14 +304,28 @@ def _worker_main(
 
             for j in range(len(chunk)):
                 word = chunk[j]
+                if len(word) < 2:
+                    continue
+
                 out: list[bytes] = []
+                created_merge_pos: set[int] = set()  # out 中由本次 merge 新产生的 merged token 位置
+                removed_old_pair_indices: set[int] = set()  # 原 word 中将被移除的旧 pair 的索引 i
+
                 k = 0
                 did_merge = False
-
                 while k < len(word):
                     if k + 1 < len(word) and word[k] == left and word[k + 1] == right:
-                        out.append(merged)
                         did_merge = True
+
+                        if k - 1 >= 0:
+                            removed_old_pair_indices.add(k - 1)
+                        removed_old_pair_indices.add(k)  # (left, right)
+                        if k + 2 < len(word):
+                            removed_old_pair_indices.add(k + 1)  # (right, next)
+
+                        out_pos = len(out)
+                        out.append(merged)
+                        created_merge_pos.add(out_pos)
                         k += 2
                     else:
                         out.append(word[k])
@@ -295,20 +334,22 @@ def _worker_main(
                 if not did_merge:
                     continue
 
-                before_counts: dict[tuple[bytes, bytes], int] = {}
-                for i in range(len(word) - 1):
+                # 新增的 pair：只围绕本次 merge 新产生的 merged token 更新
+                added_new_pair_positions: set[int] = set()
+                out_len = len(out)
+                for pos in created_merge_pos:
+                    if pos - 1 >= 0:
+                        added_new_pair_positions.add(pos - 1)
+                    if pos < out_len - 1:
+                        added_new_pair_positions.add(pos)
+
+                for i in removed_old_pair_indices:
                     p = (word[i], word[i + 1])
-                    before_counts[p] = before_counts.get(p, 0) + 1
+                    delta[p] = delta.get(p, 0) - 1
 
-                after_counts: dict[tuple[bytes, bytes], int] = {}
-                for i in range(len(out) - 1):
+                for i in added_new_pair_positions:
                     p = (out[i], out[i + 1])
-                    after_counts[p] = after_counts.get(p, 0) + 1
-
-                for p, c in after_counts.items():
-                    delta[p] = delta.get(p, 0) + c
-                for p, c in before_counts.items():
-                    delta[p] = delta.get(p, 0) - c
+                    delta[p] = delta.get(p, 0) + 1
 
                 chunk[j] = out
 
