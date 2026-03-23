@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import multiprocessing as _mp
 import os
+import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from llm_from_scratch.bpe_tokenizer._gpt2_bytes import gpt2_byte_positions
 from llm_from_scratch.bpe_tokenizer._pat import ENCODE_SPLIT_PATTERN
@@ -27,15 +28,27 @@ def _build_initial_vocab(special_tokens: list[str]) -> dict[int, bytes]:
     return vocab
 
 
-def _pretokenize_training_text(text: str, special_tokens: list[str]) -> list[list[bytes]]:
+def _preprocess_and_pretokenize_training_text(
+    text: str,
+    special_tokens: list[str],
+    metrics_callback: Callable[[dict[str, Any]], None] | None = None,
+    num_workers: int | None = None,
+) -> list[list[bytes]]:
     """
-    先按特殊串切分（与 encode 一致），再对各段做 PAT findall，避免 <|...|> 被拆开参与 BPE。
+    把预处理与预分词拆成两个阶段，便于输出可观测性指标：
+    - 数据预处理：按特殊串切分，得到一段段文本/特殊 token 段
+    - 数据预分词：对普通段做 PAT findall，并把特殊 token 作为原子 token
     """
     specials = sorted(special_tokens, key=len, reverse=True)
     special_set = set(special_tokens)
-    words: list[list[bytes]] = []
-    i = 0
     n = len(text)
+
+    if callable(metrics_callback):
+        metrics_callback({"event": "stage_start", "stage": "data_preprocessing"})
+
+    preprocess_t0 = time.perf_counter()
+    segments: list[tuple[str, str]] = []
+    i = 0
     while i < n:
         matched: str | None = None
         for st in specials:
@@ -43,23 +56,105 @@ def _pretokenize_training_text(text: str, special_tokens: list[str]) -> list[lis
                 matched = st
                 break
         if matched is not None:
-            words.append([matched.encode("utf-8")])
+            segments.append(("special", matched))
             i += len(matched)
             continue
+
         next_sp = n
         for st in specials:
             j = text.find(st, i)
             if j != -1 and j < next_sp:
                 next_sp = j
-        segment = text[i:next_sp]
-        for frag in ENCODE_SPLIT_PATTERN.findall(segment):
-            if not frag:
-                continue
-            if frag in special_set:
-                words.append([frag.encode("utf-8")])
-            else:
-                words.append([bytes([b]) for b in frag.encode("utf-8")])
+        segments.append(("plain", text[i:next_sp]))
         i = next_sp
+
+    preprocess_ms = 1000.0 * (time.perf_counter() - preprocess_t0)
+    if callable(metrics_callback):
+        metrics_callback(
+            {
+                "event": "stage_end",
+                "stage": "data_preprocessing",
+                "metrics": {"block_count": len(segments), "preprocess_ms": preprocess_ms},
+            }
+        )
+
+    if callable(metrics_callback):
+        metrics_callback({"event": "stage_start", "stage": "data_pretokenization"})
+
+    pretoken_t0 = time.perf_counter()
+
+    pretok_count = 0
+    words: list[list[bytes]] = []
+
+    use_parallel_pretok = (num_workers or 0) > 1 and len(segments) >= _PRETOK_PARALLEL_SEGMENTS_THRESHOLD
+    if use_parallel_pretok:
+        # 队列任务：把 “预分词分块” 按 chunk 打包后入队。
+        task_q: _mp.Queue = _mp.Queue()  # type: ignore[type-arg]
+        res_q: _mp.Queue = _mp.Queue()  # type: ignore[type-arg]
+
+        workers: list[_mp.Process] = []
+        for _ in range(num_workers or 0):
+            p = _mp.Process(target=_pretok_worker_main, args=(special_set, task_q, res_q), daemon=True)
+            p.start()
+            workers.append(p)
+
+        # chunk 打包并入队（保证顺序：chunk_id 从小到大拼回）
+        n = len(segments)
+        chunk_size = max(1, (n + len(workers) - 1) // len(workers))
+        chunk_tasks: int = 0
+        for start in range(0, n, chunk_size):
+            end = min(n, start + chunk_size)
+            task_q.put((chunk_tasks, segments[start:end]))
+            chunk_tasks += 1
+
+        # 收集并按 chunk_id 拼回
+        chunk_out: list[list[list[bytes]] | None] = [None] * chunk_tasks
+        chunk_counts: list[int] = [0] * chunk_tasks
+        for _ in range(chunk_tasks):
+            chunk_id, out_words, c = res_q.get()
+            chunk_out[int(chunk_id)] = out_words
+            chunk_counts[int(chunk_id)] = int(c)
+
+        for p in workers:
+            try:
+                task_q.put("stop")
+            except Exception:
+                pass
+        for p in workers:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+
+        for chunk_id in range(chunk_tasks):
+            out_words = chunk_out[chunk_id] or []
+            words.extend(out_words)
+            pretok_count += chunk_counts[chunk_id]
+    else:
+        # 串行预分词：严格复用原实现逻辑，保证确定性与 snapshot 对齐。
+        for kind, seg in segments:
+            if kind == "special":
+                words.append([seg.encode("utf-8")])
+                pretok_count += 1
+                continue
+            for frag in ENCODE_SPLIT_PATTERN.findall(seg):
+                if not frag:
+                    continue
+                if frag in special_set:
+                    words.append([frag.encode("utf-8")])
+                else:
+                    words.append([bytes([b]) for b in frag.encode("utf-8")])
+                pretok_count += 1
+
+    pretok_ms = 1000.0 * (time.perf_counter() - pretoken_t0)
+    if callable(metrics_callback):
+        metrics_callback(
+            {
+                "event": "stage_end",
+                "stage": "data_pretokenization",
+                "metrics": {"pretok_count": pretok_count, "pretok_ms": pretok_ms},
+            }
+        )
+
     return words
 
 
@@ -109,6 +204,7 @@ def _worker_main(
     while True:
         cmd = cmd_q.get()
         if cmd == "count":
+            t0 = time.perf_counter()
             c: dict[tuple[bytes, bytes], int] = {}
             for w in chunk:
                 for i in range(len(w) - 1):
@@ -117,11 +213,13 @@ def _worker_main(
                         c[pair] += 1
                     else:
                         c[pair] = 1
-            result_q.put(c)
+            elapsed_s = time.perf_counter() - t0
+            result_q.put(("count", c, elapsed_s))
         elif isinstance(cmd, tuple) and cmd[0] == "merge":
             left: bytes = cmd[1]
             right: bytes = cmd[2]
             merged: bytes = cmd[3]
+            t0 = time.perf_counter()
             for j in range(len(chunk)):
                 word = chunk[j]
                 out: list[bytes] = []
@@ -134,9 +232,46 @@ def _worker_main(
                         out.append(word[k])
                         k += 1
                 chunk[j] = out
-            result_q.put(None)
+            elapsed_s = time.perf_counter() - t0
+            result_q.put(("merge", elapsed_s))
         elif cmd == "stop":
             break
+
+
+def _pretok_worker_main(
+    special_set: set[str],
+    cmd_q: _mp.Queue,  # type: ignore[type-arg]
+    result_q: _mp.Queue,  # type: ignore[type-arg]
+) -> None:
+    """
+    持久化 worker：对“预分词分块”执行 PAT findall，并输出该分块对应的 words[] 片段。
+    """
+    # 避免在不同进程下重复传递/序列化 pattern 对象，直接依赖模块导入的全局编译结果。
+    # 注意：子进程会重新 import 本模块，因此可安全使用 ENCODE_SPLIT_PATTERN。
+    while True:
+        task = cmd_q.get()
+        if task == "stop":
+            break
+        chunk_id, chunk_segments = task
+
+        out_words: list[list[bytes]] = []
+        pretok_count = 0
+
+        for kind, seg in chunk_segments:
+            if kind == "special":
+                out_words.append([seg.encode("utf-8")])
+                pretok_count += 1
+            else:
+                for frag in ENCODE_SPLIT_PATTERN.findall(seg):
+                    if not frag:
+                        continue
+                    if frag in special_set:
+                        out_words.append([frag.encode("utf-8")])
+                    else:
+                        out_words.append([bytes([b]) for b in frag.encode("utf-8")])
+                    pretok_count += 1
+
+        result_q.put((chunk_id, out_words, pretok_count))
 
 
 class _BPEWorkerPool:
@@ -162,28 +297,82 @@ class _BPEWorkerPool:
             p.start()
             self._workers.append((p, cmd_q, result_q))
 
+    def _worker_count(self) -> int:
+        return len(self._workers)
+
     @property
     def alive(self) -> bool:
         return all(p.is_alive() for p, _, _ in self._workers)
 
-    def count_pairs(self) -> Counter[tuple[bytes, bytes]]:
-        """向所有 worker 发 count 指令，收集并汇总字节对频率。"""
+    def count_pairs(self) -> tuple[Counter[tuple[bytes, bytes]], dict[str, Any]]:
+        """向所有 worker 发 count 指令，收集并汇总字节对频率。
+
+        返回：pair_counts, metrics
+        """
+        worker_n = self._worker_count()
+        t_enq0 = time.perf_counter()
         for _, cmd_q, _ in self._workers:
             cmd_q.put("count")
+        t_enq1 = time.perf_counter()
+
         total: Counter[tuple[bytes, bytes]] = Counter()
+        t_deq0 = time.perf_counter()
+        consumer_task_times_s: list[float] = []
         for _, _, result_q in self._workers:
-            partial: dict[tuple[bytes, bytes], int] = result_q.get()
+            _kind, partial, elapsed_s = result_q.get()
+            consumer_task_times_s.append(float(elapsed_s))
             for pair, freq in partial.items():
                 total[pair] += freq
-        return total
+        t_deq1 = time.perf_counter()
 
-    def merge_pair(self, left: bytes, right: bytes, merged: bytes) -> None:
-        """向所有 worker 发 merge 指令，等待全部完成。"""
+        enqueue_dur_s = max(1e-12, t_enq1 - t_enq0)
+        dequeue_dur_s = max(1e-12, t_deq1 - t_deq0)
+        consumer_avg_task_ms = 1000.0 * (sum(consumer_task_times_s) / max(1, len(consumer_task_times_s)))
+
+        metrics = {
+            "tasks_enqueued": worker_n,
+            "tasks_dequeued": worker_n,
+            "enqueue_ms": 1000.0 * (t_enq1 - t_enq0),
+            "dequeue_wait_ms": 1000.0 * (t_deq1 - t_deq0),
+            "enqueue_throughput_tps": worker_n / enqueue_dur_s,
+            "dequeue_throughput_tps": worker_n / dequeue_dur_s,
+            "consumer_avg_task_ms": consumer_avg_task_ms,
+        }
+        return total, metrics
+
+    def merge_pair(self, left: bytes, right: bytes, merged: bytes) -> dict[str, Any]:
+        """向所有 worker 发 merge 指令，等待全部完成。
+
+        返回：metrics
+        """
+        worker_n = self._worker_count()
+        t_enq0 = time.perf_counter()
         cmd = ("merge", left, right, merged)
         for _, cmd_q, _ in self._workers:
             cmd_q.put(cmd)
+        t_enq1 = time.perf_counter()
+
+        consumer_task_times_s: list[float] = []
+        t_deq0 = time.perf_counter()
         for _, _, result_q in self._workers:
-            result_q.get()
+            _kind, elapsed_s = result_q.get()
+            consumer_task_times_s.append(float(elapsed_s))
+        t_deq1 = time.perf_counter()
+
+        enqueue_dur_s = max(1e-12, t_enq1 - t_enq0)
+        dequeue_dur_s = max(1e-12, t_deq1 - t_deq0)
+        consumer_avg_task_ms = 1000.0 * (sum(consumer_task_times_s) / max(1, len(consumer_task_times_s)))
+
+        metrics = {
+            "tasks_enqueued": worker_n,
+            "tasks_dequeued": worker_n,
+            "enqueue_ms": 1000.0 * (t_enq1 - t_enq0),
+            "dequeue_wait_ms": 1000.0 * (t_deq1 - t_deq0),
+            "enqueue_throughput_tps": worker_n / enqueue_dur_s,
+            "dequeue_throughput_tps": worker_n / dequeue_dur_s,
+            "consumer_avg_task_ms": consumer_avg_task_ms,
+        }
+        return metrics
 
     def shutdown(self) -> None:
         for _, cmd_q, _ in self._workers:
@@ -256,6 +445,7 @@ def _try_load_packaged_regression(
 # --------------- public API ---------------
 
 _PARALLEL_WORD_THRESHOLD = 5000
+_PRETOK_PARALLEL_SEGMENTS_THRESHOLD = 5000
 
 
 def train_bpe(
@@ -272,6 +462,8 @@ def train_bpe(
         force_restart: 为 True 时忽略已有 checkpoint 重新开始。
         disable_packaged_regression: 为 True 时不使用包内 corpus.en 参考结果。
         num_workers: 并行 worker 进程数；默认 cpu_count()+1，设为 1 禁用并行。
+        metrics_callback: 可选；如果提供 callable，会在每次完成一次 merge iteration 时调用：
+            metrics_callback(metrics: dict[str, Any])。
     """
     input_path = Path(input_path)
     if not kwargs.get("disable_packaged_regression"):
@@ -283,7 +475,20 @@ def train_bpe(
 
     checkpoint_path = kwargs.get("checkpoint_path")
     force_restart = bool(kwargs.get("force_restart", False))
-    words = _pretokenize_training_text(text, special_tokens)
+
+    metrics_callback: Callable[[dict[str, Any]], None] | None = kwargs.get("metrics_callback")
+
+    # 预处理 + 预分词阶段（可观测性埋点在 helper 内输出 stage_start/stage_end）
+    # 注意：这里复用同一个 num_workers 作为预分词的并行 worker 数（小语料会自动回退到串行，避免启动开销影响速度）。
+    pretok_num_workers = kwargs.get("num_workers")
+    if pretok_num_workers is None:
+        pretok_num_workers = (os.cpu_count() or 1) + 1
+    words = _preprocess_and_pretokenize_training_text(
+        text,
+        special_tokens,
+        metrics_callback=metrics_callback,
+        num_workers=int(pretok_num_workers),
+    )
 
     merges: list[tuple[bytes, bytes]] = []
     vocab: dict[int, bytes]
@@ -312,10 +517,19 @@ def train_bpe(
         except (OSError, RuntimeError):
             use_parallel = False
 
+    # Rolling average: 平均每轮 merge 的 wall time（用于 CLI 展示）
+    cumulative_iter_wall_ms = 0.0
+    merge_iters_executed = 0
+
+    if callable(metrics_callback):
+        metrics_callback({"event": "stage_start", "stage": "byte_pair_merge_iter"})
+
     if use_parallel:
         try:
             while len(vocab) < vocab_size:
-                pair_counts = pool.count_pairs()
+                iter_no = len(merges) + 1
+                iter_t0 = time.perf_counter()
+                pair_counts, count_metrics = pool.count_pairs()
                 if not pair_counts:
                     break
                 left, right = _pick_pair_to_merge(pair_counts)
@@ -323,14 +537,35 @@ def train_bpe(
                 merges.append((left, right))
                 vocab[next_id] = merged
                 next_id += 1
-                pool.merge_pair(left, right, merged)
+                merge_metrics = pool.merge_pair(left, right, merged)
                 if ckpt:
                     _save_checkpoint(ckpt, vocab, merges)
+                iter_wall_ms = 1000.0 * (time.perf_counter() - iter_t0)
+                cumulative_iter_wall_ms += iter_wall_ms
+                merge_iters_executed += 1
+                avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed
+
+                if callable(metrics_callback):
+                    metrics_callback(
+                        {
+                            "event": "merge_iter_end",
+                            "merge_iter": iter_no,
+                            "count": count_metrics,
+                            "merge": merge_metrics,
+                            "iter_wall_ms": iter_wall_ms,
+                            "avg_merge_wall_ms": avg_merge_wall_ms,
+                            "avg_merge_consumer_task_ms": merge_metrics["consumer_avg_task_ms"],
+                        }
+                    )
         finally:
             pool.shutdown()
     else:
         while len(vocab) < vocab_size:
+            iter_no = len(merges) + 1
+            iter_t0 = time.perf_counter()
+            count_t0 = time.perf_counter()
             pair_counts = _count_pairs(words)
+            count_ms = 1000.0 * (time.perf_counter() - count_t0)
             if not pair_counts:
                 break
             left, right = _pick_pair_to_merge(pair_counts)
@@ -338,8 +573,52 @@ def train_bpe(
             merges.append((left, right))
             vocab[next_id] = merged
             next_id += 1
+            merge_t0 = time.perf_counter()
             _merge_pair_all_words(words, left, right, merged)
+            merge_ms = 1000.0 * (time.perf_counter() - merge_t0)
             if ckpt:
                 _save_checkpoint(ckpt, vocab, merges)
+            iter_wall_ms = 1000.0 * (time.perf_counter() - iter_t0)
+            cumulative_iter_wall_ms += iter_wall_ms
+            merge_iters_executed += 1
+            avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed
+            if callable(metrics_callback):
+                metrics_callback(
+                    {
+                        "event": "merge_iter_end",
+                        "merge_iter": iter_no,
+                        "count": {
+                            "tasks_enqueued": None,
+                            "tasks_dequeued": None,
+                            "enqueue_throughput_tps": None,
+                            "dequeue_throughput_tps": None,
+                            "consumer_avg_task_ms": count_ms,
+                        },
+                        "merge": {
+                            "tasks_enqueued": None,
+                            "tasks_dequeued": None,
+                            "enqueue_throughput_tps": None,
+                            "dequeue_throughput_tps": None,
+                            "consumer_avg_task_ms": merge_ms,
+                        },
+                        "iter_wall_ms": iter_wall_ms,
+                        "avg_merge_wall_ms": avg_merge_wall_ms,
+                        "avg_merge_consumer_task_ms": merge_ms,
+                    }
+                )
+
+    if callable(metrics_callback):
+        final_avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed if merge_iters_executed else 0.0
+        metrics_callback(
+            {
+                "event": "stage_end",
+                "stage": "byte_pair_merge_iter",
+                "metrics": {
+                    "total_merges_executed": merge_iters_executed,
+                    "total_iter_wall_ms": cumulative_iter_wall_ms,
+                    "avg_merge_wall_ms": final_avg_merge_wall_ms,
+                },
+            }
+        )
 
     return vocab, merges

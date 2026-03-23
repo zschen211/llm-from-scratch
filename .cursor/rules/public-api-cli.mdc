@@ -18,7 +18,7 @@ alwaysApply: false
   例：`llm_from_scratch.bpe_tokenizer.tokenizer` → `cli/llm_from_scratch/bpe_tokenizer/`
 - **按类区分文件**：同一模块多个 public 类时，每个类一个 CLI 文件，命名：  
   **`<ClassName>_cli.py`**（PascalCase 类名 + `_cli` 后缀）。  
-  例：`BPETokenizer` → `cli/llm_from_scratch/bpe_tokenizer/BPETokenizer_cli.py`
+  例：`BPETokenizer` → `cli/llm_from_scratch/bpe_tokenizer/bpe_tokenizer_cli.py`
 - **仅模块级 public 函数、无主要类**时：使用 **`<module>_cli.py`**，与源模块名一致。  
   例：`train_bpe` 在 `bpe_train.py` → `bpe_train_cli.py`
 

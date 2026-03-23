@@ -1,0 +1,13 @@
+---
+description: `cli/` 与 `cli-tests/` 下的 .py 文件名仅允许小写字母与下划线
+globs: cli/**/*.py,cli-tests/**/*.py
+alwaysApply: false
+---
+
+# Python 文件命名约束
+
+## 必须遵守
+
+1. `cli/` 与 `cli-tests/` 下的所有 `.py` 文件名（不含目录）必须满足：仅由 `a-z` 与 `_` 组成。
+2. 禁止出现大写字母、驼峰命名、或其它符号（例如 `-`、空格等）。
+
