@@ -6,7 +6,7 @@ from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
-from llm_from_scratch.bpe_tokenizer import train_bpe
+from llm_from_scratch.bpe_tokenizer import make_tokenizer, train_bpe
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -560,7 +560,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return make_tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
