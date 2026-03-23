@@ -185,6 +185,60 @@ def _merge_pair_all_words(words: list[list[bytes]], left: bytes, right: bytes, m
         words[j] = _merge_pair_in_word(words[j], left, right, merged)
 
 
+def _merge_pair_all_words_with_pair_deltas(
+    words: list[list[bytes]],
+    left: bytes,
+    right: bytes,
+    merged: bytes,
+) -> dict[tuple[bytes, bytes], int]:
+    """
+    将所有 words 内的 (left, right) 合并为 merged，并返回“字节对频率”的增量变化。
+
+    返回值 delta[pair] 表示合并后 pair 的计数相对合并前的变化量（可为负）。
+    """
+    delta: dict[tuple[bytes, bytes], int] = {}
+    for j in range(len(words)):
+        word = words[j]
+        out: list[bytes] = []
+        k = 0
+        did_merge = False
+
+        while k < len(word):
+            if k + 1 < len(word) and word[k] == left and word[k + 1] == right:
+                out.append(merged)
+                did_merge = True
+                k += 2
+            else:
+                out.append(word[k])
+                k += 1
+
+        if not did_merge:
+            continue
+
+        # 只对发生过合并的 word 做 pair 统计差分，避免无谓的额外开销。
+        before_counts: dict[tuple[bytes, bytes], int] = {}
+        for i in range(len(word) - 1):
+            p = (word[i], word[i + 1])
+            before_counts[p] = before_counts.get(p, 0) + 1
+
+        after_counts: dict[tuple[bytes, bytes], int] = {}
+        for i in range(len(out) - 1):
+            p = (out[i], out[i + 1])
+            after_counts[p] = after_counts.get(p, 0) + 1
+
+        for p, c in after_counts.items():
+            delta[p] = delta.get(p, 0) + c
+        for p, c in before_counts.items():
+            delta[p] = delta.get(p, 0) - c
+
+        words[j] = out
+
+    # 清理 0 项，保证后续 max(pair_counts.values()) 语义稳定。
+    if delta:
+        delta = {p: v for p, v in delta.items() if v != 0}
+    return delta
+
+
 def _pick_pair_to_merge(pair_counts: Counter[tuple[bytes, bytes]]) -> tuple[bytes, bytes]:
     """频率最高；并列时取字节对字典序最大（CS336 常见约定）。"""
     best_freq = max(pair_counts.values())
@@ -215,6 +269,54 @@ def _worker_main(
                         c[pair] = 1
             elapsed_s = time.perf_counter() - t0
             result_q.put(("count", c, elapsed_s))
+        elif isinstance(cmd, tuple) and cmd[0] == "merge_delta":
+            left: bytes = cmd[1]
+            right: bytes = cmd[2]
+            merged: bytes = cmd[3]
+
+            t0 = time.perf_counter()
+            delta: dict[tuple[bytes, bytes], int] = {}
+
+            for j in range(len(chunk)):
+                word = chunk[j]
+                out: list[bytes] = []
+                k = 0
+                did_merge = False
+
+                while k < len(word):
+                    if k + 1 < len(word) and word[k] == left and word[k + 1] == right:
+                        out.append(merged)
+                        did_merge = True
+                        k += 2
+                    else:
+                        out.append(word[k])
+                        k += 1
+
+                if not did_merge:
+                    continue
+
+                before_counts: dict[tuple[bytes, bytes], int] = {}
+                for i in range(len(word) - 1):
+                    p = (word[i], word[i + 1])
+                    before_counts[p] = before_counts.get(p, 0) + 1
+
+                after_counts: dict[tuple[bytes, bytes], int] = {}
+                for i in range(len(out) - 1):
+                    p = (out[i], out[i + 1])
+                    after_counts[p] = after_counts.get(p, 0) + 1
+
+                for p, c in after_counts.items():
+                    delta[p] = delta.get(p, 0) + c
+                for p, c in before_counts.items():
+                    delta[p] = delta.get(p, 0) - c
+
+                chunk[j] = out
+
+            if delta:
+                delta = {p: v for p, v in delta.items() if v != 0}
+
+            elapsed_s = time.perf_counter() - t0
+            result_q.put(("merge_delta", delta, elapsed_s))
         elif isinstance(cmd, tuple) and cmd[0] == "merge":
             left: bytes = cmd[1]
             right: bytes = cmd[2]
@@ -374,6 +476,47 @@ class _BPEWorkerPool:
         }
         return metrics
 
+    def merge_pair_with_pair_deltas(
+        self, left: bytes, right: bytes, merged: bytes
+    ) -> tuple[dict[tuple[bytes, bytes], int], dict[str, Any]]:
+        """向所有 worker 发 merge_delta 指令，并返回全局 pair delta。"""
+        worker_n = self._worker_count()
+        t_enq0 = time.perf_counter()
+        cmd = ("merge_delta", left, right, merged)
+        for _, cmd_q, _ in self._workers:
+            cmd_q.put(cmd)
+        t_enq1 = time.perf_counter()
+
+        total_delta: dict[tuple[bytes, bytes], int] = {}
+        consumer_task_times_s: list[float] = []
+        t_deq0 = time.perf_counter()
+
+        for _, _, result_q in self._workers:
+            _kind, partial_delta, elapsed_s = result_q.get()
+            consumer_task_times_s.append(float(elapsed_s))
+            for pair, d in partial_delta.items():
+                total_delta[pair] = total_delta.get(pair, 0) + int(d)
+        t_deq1 = time.perf_counter()
+
+        # 清理 0 项（避免后续 pair_counts 更新时出现 -0 之类的麻烦）
+        if total_delta:
+            total_delta = {p: v for p, v in total_delta.items() if v != 0}
+
+        enqueue_dur_s = max(1e-12, t_enq1 - t_enq0)
+        dequeue_dur_s = max(1e-12, t_deq1 - t_deq0)
+        consumer_avg_task_ms = 1000.0 * (sum(consumer_task_times_s) / max(1, len(consumer_task_times_s)))
+
+        metrics = {
+            "tasks_enqueued": worker_n,
+            "tasks_dequeued": worker_n,
+            "enqueue_ms": 1000.0 * (t_enq1 - t_enq0),
+            "dequeue_wait_ms": 1000.0 * (t_deq1 - t_deq0),
+            "enqueue_throughput_tps": worker_n / enqueue_dur_s,
+            "dequeue_throughput_tps": worker_n / dequeue_dur_s,
+            "consumer_avg_task_ms": consumer_avg_task_ms,
+        }
+        return total_delta, metrics
+
     def shutdown(self) -> None:
         for _, cmd_q, _ in self._workers:
             try:
@@ -464,12 +607,22 @@ def train_bpe(
         num_workers: 并行 worker 进程数；默认 cpu_count()+1，设为 1 禁用并行。
         metrics_callback: 可选；如果提供 callable，会在每次完成一次 merge iteration 时调用：
             metrics_callback(metrics: dict[str, Any])。
+        profile_dir: 可选；若提供目录路径，使用 cProfile 对训练全程采样并将
+            .prof 文件写入该目录（文件名含时间戳与 PID）。
     """
     input_path = Path(input_path)
     if not kwargs.get("disable_packaged_regression"):
         reg = _try_load_packaged_regression(input_path, vocab_size, special_tokens)
         if reg is not None:
             return reg
+
+    profile_dir: str | None = kwargs.get("profile_dir")
+    _profiler = None
+    if profile_dir:
+        import cProfile
+
+        _profiler = cProfile.Profile()
+        _profiler.enable()
 
     text = input_path.read_text(encoding="utf-8")
 
@@ -517,6 +670,13 @@ def train_bpe(
         except (OSError, RuntimeError):
             use_parallel = False
 
+    pair_counts: Counter[tuple[bytes, bytes]] | None = None
+    count_metrics: dict[str, Any] | None = None
+
+    if use_parallel:
+        # 只统计一次；后续通过 merge 后的增量 delta 来维护 pair_counts
+        pair_counts, count_metrics = pool.count_pairs()
+
     # Rolling average: 平均每轮 merge 的 wall time（用于 CLI 展示）
     cumulative_iter_wall_ms = 0.0
     merge_iters_executed = 0
@@ -529,7 +689,6 @@ def train_bpe(
             while len(vocab) < vocab_size:
                 iter_no = len(merges) + 1
                 iter_t0 = time.perf_counter()
-                pair_counts, count_metrics = pool.count_pairs()
                 if not pair_counts:
                     break
                 left, right = _pick_pair_to_merge(pair_counts)
@@ -537,7 +696,15 @@ def train_bpe(
                 merges.append((left, right))
                 vocab[next_id] = merged
                 next_id += 1
-                merge_metrics = pool.merge_pair(left, right, merged)
+
+                merge_delta, merge_metrics = pool.merge_pair_with_pair_deltas(left, right, merged)
+                for p, d in merge_delta.items():
+                    new_v = pair_counts.get(p, 0) + d
+                    if new_v > 0:
+                        pair_counts[p] = new_v
+                    else:
+                        pair_counts.pop(p, None)
+
                 if ckpt:
                     _save_checkpoint(ckpt, vocab, merges)
                 iter_wall_ms = 1000.0 * (time.perf_counter() - iter_t0)
@@ -550,7 +717,7 @@ def train_bpe(
                         {
                             "event": "merge_iter_end",
                             "merge_iter": iter_no,
-                            "count": count_metrics,
+                            "count": count_metrics if iter_no == 1 else None,
                             "merge": merge_metrics,
                             "iter_wall_ms": iter_wall_ms,
                             "avg_merge_wall_ms": avg_merge_wall_ms,
@@ -560,21 +727,30 @@ def train_bpe(
         finally:
             pool.shutdown()
     else:
+        count_t0 = time.perf_counter()
+        pair_counts = _count_pairs(words)
+        count_ms = 1000.0 * (time.perf_counter() - count_t0)
         while len(vocab) < vocab_size:
             iter_no = len(merges) + 1
             iter_t0 = time.perf_counter()
-            count_t0 = time.perf_counter()
-            pair_counts = _count_pairs(words)
-            count_ms = 1000.0 * (time.perf_counter() - count_t0)
+
             if not pair_counts:
                 break
+
             left, right = _pick_pair_to_merge(pair_counts)
             merged = left + right
             merges.append((left, right))
             vocab[next_id] = merged
             next_id += 1
+
             merge_t0 = time.perf_counter()
-            _merge_pair_all_words(words, left, right, merged)
+            merge_delta = _merge_pair_all_words_with_pair_deltas(words, left, right, merged)
+            for p, d in merge_delta.items():
+                new_v = pair_counts.get(p, 0) + d
+                if new_v > 0:
+                    pair_counts[p] = new_v
+                else:
+                    pair_counts.pop(p, None)
             merge_ms = 1000.0 * (time.perf_counter() - merge_t0)
             if ckpt:
                 _save_checkpoint(ckpt, vocab, merges)
@@ -592,7 +768,7 @@ def train_bpe(
                             "tasks_dequeued": None,
                             "enqueue_throughput_tps": None,
                             "dequeue_throughput_tps": None,
-                            "consumer_avg_task_ms": count_ms,
+                            "consumer_avg_task_ms": count_ms if iter_no == 1 else None,
                         },
                         "merge": {
                             "tasks_enqueued": None,
@@ -620,5 +796,14 @@ def train_bpe(
                 },
             }
         )
+
+    if _profiler is not None:
+        _profiler.disable()
+        _prof_dir = Path(profile_dir)  # type: ignore[arg-type]
+        _prof_dir.mkdir(parents=True, exist_ok=True)
+        _prof_file = _prof_dir / f"train_bpe_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.prof"
+        _profiler.dump_stats(str(_prof_file))
+        if callable(metrics_callback):
+            metrics_callback({"event": "profile_saved", "path": str(_prof_file)})
 
     return vocab, merges

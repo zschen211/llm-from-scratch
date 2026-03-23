@@ -59,11 +59,30 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional checkpoint path written during training (same JSON format).",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable cProfile profiling; saves .prof file to --profile-dir (default: .prof/).",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default=None,
+        help="Directory for .prof output (implies --profile). Default: <project_root>/.prof/",
+    )
 
     args = parser.parse_args(argv)
 
     def _maybe_print_metrics(metrics: dict[str, Any]) -> None:
         event = metrics.get("event")
+
+        if event == "profile_saved":
+            print(f"[profile] saved: {metrics.get('path')}", flush=True)
+            return
+
+        if args.no_print_metrics:
+            return
+
         stage = metrics.get("stage")
 
         # 1) stage start/end
@@ -111,7 +130,12 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
-    metrics_callback = None if args.no_print_metrics else _maybe_print_metrics
+    profile_dir = None
+    if args.profile or args.profile_dir:
+        profile_dir = args.profile_dir or str(_project_root / ".prof")
+
+    needs_callback = not args.no_print_metrics or profile_dir
+    metrics_callback = _maybe_print_metrics if needs_callback else None
 
     vocab, merges = train_bpe(
         input_path=Path(args.input_corpus),
@@ -122,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         force_restart=bool(args.force_restart),
         checkpoint_path=args.checkpoint_path,
         metrics_callback=metrics_callback,
+        profile_dir=profile_dir,
     )
 
     _save_checkpoint(Path(args.out), vocab=vocab, merges=merges)
