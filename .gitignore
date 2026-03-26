@@ -10,3 +10,4 @@ __pycache__/
 .venv/
 venv/
 .prof/
+llm_from_scratch.egg-info/
