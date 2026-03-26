@@ -1,0 +1,21 @@
+# 大数据目录不打进镜像：运行时通过 volume 方式挂载
+data/
+
+# 产物与缓存
+runs/
+.prof/
+*.prof
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+llm_from_scratch.egg-info/
+
+# 调试/评估脚本不需要进镜像
+evaluation/
+tokenizer/
+
+# git 相关
+.git/
+

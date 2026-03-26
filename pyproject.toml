@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "llm-from-scratch"
 version = "0.1.0"
@@ -7,6 +11,12 @@ dependencies = [
     "regex>=2023.0",
     "torch>=2.10.0",
 ]
+
+[tool.setuptools.package-dir]
+"llm_from_scratch" = "src"
+
+[tool.setuptools]
+packages = ["llm_from_scratch", "llm_from_scratch.bpe_tokenizer"]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"

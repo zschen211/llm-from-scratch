@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 1s
+
+scrape_configs:
+  - job_name: sandbox_metrics
+    # 兼容两种网络环境：
+    # 1) Docker for Mac / Windows 常用 host.docker.internal
+    # 2) 纯 Linux / WSL2 有时直接 localhost:PORT 更可用
+    static_configs:
+      - targets:
+          - "host.docker.internal:19090"
+          - "localhost:19090"
+

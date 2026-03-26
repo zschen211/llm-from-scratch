@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+WORKDIR /workspace
+
+# 复制项目代码与元数据（data/ 会通过 .dockerignore 排除，并在运行时以 volume 方式挂载）
+COPY pyproject.toml uv.lock /workspace/
+COPY src /workspace/src
+COPY cli /workspace/cli
+COPY main.py /workspace/
+
+# 安装项目依赖 + 可导入当前代码
+RUN pip install --no-cache-dir -e .
+
+ENV PYTHONPATH=/workspace/src
+
+# 默认入口：sandbox runner 的容器侧执行器
+ENTRYPOINT ["python", "-m", "llm_from_scratch.sandbox.sandbox_runner_entrypoint"]
+

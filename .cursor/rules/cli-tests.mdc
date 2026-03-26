@@ -1,6 +1,6 @@
 ---
 description: 每个 CLI 需在 cli-tests/ 中有对应测试；改 CLI 或 public API 后须跑测并更新测试
-globs: cli/**/*.py,cli-tests/**/*.py,llm_from_scratch/**/*.py
+globs: cli/**/*.py,cli-tests/**/*.py,src/**/*.py
 alwaysApply: false
 ---
 
@@ -9,7 +9,7 @@ alwaysApply: false
 ## 必须遵守
 
 1. **`cli/` 下每个可执行入口**（每个 `*_cli.py` 或约定好的 CLI 脚本）在 **`cli-tests/`** 中须有 **对应测试模块**，命名与 CLI 路径对齐，便于一一映射。  
-   例：`cli/llm_from_scratch/bpe_tokenizer/bpe_tokenizer_cli.py` → `cli-tests/llm_from_scratch/bpe_tokenizer/test_bpe_tokenizer_cli.py`（或同级结构的 `test_*_cli.py`）。
+   例：`cli/llm_from_scratch/bpe_tokenizer/bpe_tokenizer_cli.py` → `cli-tests/cli/llm_from_scratch/bpe_tokenizer/test_bpe_tokenizer_cli.py`（或同级结构的 `test_*_cli.py`）；`cli-tests` 下须多一层 `cli/`，避免顶层目录名 `llm_from_scratch` 与包名冲突。
 
 2. **测试范围**：不仅对「成功路径」断言，还须覆盖 **边界与失败场景**，例如：  
    - 缺参、非法参数、`--help` 可运行  

@@ -188,7 +188,7 @@ wheels = [
 [[package]]
 name = "llm-from-scratch"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "regex" },
     { name = "torch" },

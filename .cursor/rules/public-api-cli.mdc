@@ -1,6 +1,6 @@
 ---
 description: 每个 public 方法需有对应 CLI；CLI 放在 cli/ 下并按包名+类名组织
-globs: llm_from_scratch/**/*.py,cli/**/*.py
+globs: src/**/*.py,cli/**/*.py
 alwaysApply: false
 ---
 
@@ -10,11 +10,11 @@ alwaysApply: false
 
 1. **每个对外暴露的 public 方法**（模块级函数或类上无下划线前缀的方法）在合并代码前，都应有 **可直接调用的 CLI**，用于手动验证该行为。
 2. **修改 public 方法**（签名、语义、副作用）时，**同一 PR / 提交内**须同步更新对应 CLI（参数、帮助文案、示例）。
-3. **CLI 根目录**：项目根下的 `cli/`（勿放在包内 `llm_from_scratch/` 下）。
+3. **CLI 根目录**：项目根下的 `cli/`（勿放在包内 `src/` 下）。
 
 ## 目录与命名（package + class）
 
-- 按 **Python 包路径**建子目录，与 `llm_from_scratch` 下包结构一致。  
+- 按 **Python 包路径**建子目录，与 `src/` 下包结构一致（导入名仍为 `llm_from_scratch.*`）。  
   例：`llm_from_scratch.bpe_tokenizer.tokenizer` → `cli/llm_from_scratch/bpe_tokenizer/`
 - **按类区分文件**：同一模块多个 public 类时，每个类一个 CLI 文件，命名：  
   **`<ClassName>_cli.py`**（PascalCase 类名 + `_cli` 后缀）。  
