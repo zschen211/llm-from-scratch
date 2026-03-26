@@ -1,0 +1,11 @@
+regex>=2023.0
+torch>=2.10.0
+
+[dev]
+pytest>=7.0
+tiktoken>=0.5
+numpy>=1.24
+torch>=2.0
+einops>=0.7
+jaxtyping>=0.2
+psutil>=5.9

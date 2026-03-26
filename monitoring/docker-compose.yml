@@ -1,6 +1,9 @@
 services:
   prometheus:
-    image: prom/prometheus:v2.54.1
+    # 国内网络环境下可用的 Docker Hub 镜像代理（Daocloud）
+    image: docker.m.daocloud.io/prom/prometheus:v2.54.1
+    # 让 Prometheus 能写入挂载的 ./data -> /prometheus，避免 permission denied
+    user: "0:0"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./data:/prometheus
@@ -10,7 +13,8 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
   grafana:
-    image: grafana/grafana:11.0.0
+    # 国内网络环境下可用的 Docker Hub 镜像代理（Daocloud）
+    image: docker.m.daocloud.io/grafana/grafana:11.0.0
     ports:
       - "3000:3000"
 

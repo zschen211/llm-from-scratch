@@ -1,0 +1,11 @@
+DOCKER_BUILD:
+docker build -t llm-from-scratch-sandbox:dev -f /home/cheese/docker/Dockerfile.sandbox /home/cheese
+
+DOCKER_RUN:
+docker run --rm --name llm-sandbox-ef8f3466-aa10-4dc7-8a4f-0ee8a757eafc --cpus 8.0 --memory 8g -p 19090:8000 -v /home/cheese/data:/workspace/data:ro -v runs/ef8f3466-aa10-4dc7-8a4f-0ee8a757eafc:/sandbox_out -v runs/ef8f3466-aa10-4dc7-8a4f-0ee8a757eafc/prof:/workspace/.prof -e SANDBOX_RUN_ID=ef8f3466-aa10-4dc7-8a4f-0ee8a757eafc -e SANDBOX_OUT_DIR=/sandbox_out -e SANDBOX_METRICS_PATH=/sandbox_out/metrics/metrics.prom -e SANDBOX_METRICS_INTERVAL_S=1.0 -e SANDBOX_CPU_LIMIT=8.0 llm-from-scratch-sandbox:dev --out-dir /sandbox_out --metrics-port 8000 --metrics-path /sandbox_out/metrics/metrics.prom --metrics-interval-s 1.0 -- -- python -c 'cli/bpe_tokenizer/train_bpe_cli.py \
+    --input-corpus data/TinyStoriesV2-GPT4-train.txt \
+    --vocab-size 10000 \
+    --special-token "<|endoftext|>" \
+    --out tokenizer/bpe_tokenizer_tinystories_train.json \
+    --stream-memory-target-percent 85 \
+    --profile'

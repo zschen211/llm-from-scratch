@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing as _mp
 import os
 import pickle
@@ -12,6 +13,8 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
+
+_log = logging.getLogger(__name__)
 
 from llm_from_scratch.bpe_tokenizer._gpt2_bytes import gpt2_byte_positions
 from llm_from_scratch.bpe_tokenizer._pat import ENCODE_SPLIT_PATTERN
@@ -820,6 +823,7 @@ def train_bpe(
     if not kwargs.get("disable_packaged_regression"):
         reg = _try_load_packaged_regression(input_path, vocab_size, special_tokens)
         if reg is not None:
+            _log.info("Using packaged regression result for %s (vocab_size=%d)", input_path.name, vocab_size)
             return reg
 
     profile_dir: str | None = kwargs.get("profile_dir")
@@ -835,6 +839,13 @@ def train_bpe(
 
     metrics_callback: Callable[[dict[str, Any]], None] | None = kwargs.get("metrics_callback")
     stream_chunk_chars = int(kwargs.get("stream_chunk_chars", 1_000_000) or 1_000_000)
+
+    file_size_mb = input_path.stat().st_size / (1024 * 1024)
+    mode_label = "streaming" if stream_chunk_chars > 0 else "in-memory"
+    _log.info(
+        "train_bpe start: input=%s (%.1f MB), vocab_size=%d, special_tokens=%d, mode=%s",
+        input_path.name, file_size_mb, vocab_size, len(special_tokens), mode_label,
+    )
 
     if stream_chunk_chars > 0:
 
@@ -871,12 +882,16 @@ def train_bpe(
 
         chunk_files: list[Path] = []
         memory_target_percent = float(kwargs.get("stream_memory_target_percent", 85) or 85)
+        # pretokenize 阶段需要预留 pickle 序列化开销（memo dict ≈ 30-40% 额外内存）
+        # 和下一次 read+pretokenize 的内存空间，因此使用更保守的阈值。
+        pretok_dump_threshold = max(30.0, memory_target_percent - 20.0)
         split_special = max(special_tokens, key=len, default="<|endoftext|>")
         file_size = input_path.stat().st_size
 
         try:
             if callable(metrics_callback):
                 metrics_callback({"event": "stage_start", "stage": "data_pretokenization"})
+            _log.info("[pretokenize] streaming pretokenization starting (chunk_chars=%d, mem_threshold=%.0f%%)", stream_chunk_chars, pretok_dump_threshold)
             pretok_total_t0 = time.perf_counter()
             pretok_total_count = 0
             chunk_index = 0
@@ -885,14 +900,14 @@ def train_bpe(
             with open(input_path, "r", encoding="utf-8") as f:
                 carry = ""
                 while True:
-                    # 在读取+pretokenize 之前检查内存，避免在高水位下执行重操作
                     if accumulated_words:
                         mem = _get_system_memory_percent()
-                        if mem is not None and mem >= memory_target_percent:
+                        if mem is not None and mem >= pretok_dump_threshold:
                             chunk_index += 1
                             cpath = chunks_dir / f"chunk_{chunk_index:06d}.pkl"
                             _dump_words_chunk(cpath, accumulated_words)
                             chunk_files.append(cpath)
+                            _log.info("[pretokenize] memory %.0f%% >= threshold, spilled chunk_%06d to disk (words=%d)", mem, chunk_index, len(accumulated_words))
                             accumulated_words = []
                             _force_release_memory()
 
@@ -923,7 +938,7 @@ def train_bpe(
                         text,
                         special_tokens,
                         metrics_callback=None,
-                        num_workers=int(pretok_num_workers),
+                        num_workers=1,
                     )
                     accumulated_words.extend(words_part)
                     pretok_total_count += len(words_part)
@@ -947,6 +962,11 @@ def train_bpe(
                 chunk_files.append(cpath)
                 accumulated_words = []
 
+            pretok_elapsed_ms = 1000.0 * (time.perf_counter() - pretok_total_t0)
+            _log.info(
+                "[pretokenize] done: total_words=%d, chunks_on_disk=%d, elapsed=%.1fs",
+                pretok_total_count, len(chunk_files), pretok_elapsed_ms / 1000.0,
+            )
             if callable(metrics_callback):
                 metrics_callback(
                     {
@@ -954,7 +974,7 @@ def train_bpe(
                         "stage": "data_pretokenization",
                         "metrics": {
                             "pretok_count": pretok_total_count,
-                            "pretok_ms": 1000.0 * (time.perf_counter() - pretok_total_t0),
+                            "pretok_ms": pretok_elapsed_ms,
                         },
                     }
                 )
@@ -966,12 +986,13 @@ def train_bpe(
                     {"event": "stage_start", "stage": "byte_pair_merge_iter", "merges_target": merges_target}
                 )
 
-            # 尝试一次性加载全部 chunk 到内存；装得下则全程内存操作，
-            # 装不下则退回每轮 merge 分批读写磁盘的模式。
+            _log.info("[merge] starting BPE merge iterations (target=%d merges)", merges_target)
+
             first_batch, first_next = _load_chunk_batch(
                 chunk_files, 0, memory_target_percent,
             )
             all_in_memory = first_next >= len(chunk_files)
+            _log.info("[merge] chunk loading: all_in_memory=%s (%d/%d chunks loaded)", all_in_memory, first_next, len(chunk_files))
 
             pair_counts: Counter[tuple[bytes, bytes]] = Counter()
 
@@ -1050,6 +1071,13 @@ def train_bpe(
                 merge_iters_executed += 1
                 avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed
 
+                _stream_merge_log_interval = max(1, merges_target // 20)
+                if iter_no == 1 or iter_no % _stream_merge_log_interval == 0 or iter_no == merges_target:
+                    _log.info(
+                        "[merge] %d/%d (%.0f%%) avg=%.1fms/iter",
+                        iter_no, merges_target, 100.0 * iter_no / max(merges_target, 1), avg_merge_wall_ms,
+                    )
+
                 if callable(metrics_callback):
                     metrics_callback(
                         {
@@ -1065,6 +1093,8 @@ def train_bpe(
                         }
                     )
 
+            total_merge_s = cumulative_iter_wall_ms / 1000.0
+            _log.info("[merge] streaming merge done: %d merges in %.1fs", merge_iters_executed, total_merge_s)
             if callable(metrics_callback):
                 final_avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed if merge_iters_executed else 0.0
                 metrics_callback(
@@ -1088,6 +1118,7 @@ def train_bpe(
                 if callable(metrics_callback):
                     metrics_callback({"event": "profile_saved", "path": str(_prof_file)})
 
+            _log.info("train_bpe done: vocab_size=%d, merges=%d", len(vocab), len(merges))
             return vocab, merges
         finally:
             if kwargs.get("stream_keep_workdir"):
@@ -1095,10 +1126,12 @@ def train_bpe(
             else:
                 shutil.rmtree(workdir, ignore_errors=True)
     else:
+        _log.info("[in-memory] reading entire file into memory ...")
         text = input_path.read_text(encoding="utf-8")
+        _log.info("[in-memory] read complete: %d chars", len(text))
 
-    # 预处理 + 预分词阶段（可观测性埋点在 helper 内输出 stage_start/stage_end）
-    # 注意：这里复用同一个 num_workers 作为预分词的并行 worker 数（小语料会自动回退到串行，避免启动开销影响速度）。
+    _log.info("[pretokenize] in-memory pretokenization starting ...")
+    pretok_t0 = time.perf_counter()
     pretok_num_workers = kwargs.get("num_workers")
     if pretok_num_workers is None:
         pretok_num_workers = (os.cpu_count() or 1) + 1
@@ -1108,6 +1141,7 @@ def train_bpe(
         metrics_callback=metrics_callback,
         num_workers=int(pretok_num_workers),
     )
+    _log.info("[pretokenize] done: %d words, elapsed=%.1fs", len(words), time.perf_counter() - pretok_t0)
 
     merges: list[tuple[bytes, bytes]] = []
     vocab: dict[int, bytes]
@@ -1115,10 +1149,12 @@ def train_bpe(
 
     ckpt = Path(checkpoint_path) if checkpoint_path else None
     if ckpt and not force_restart and ckpt.is_file():
+        _log.info("[checkpoint] resuming from %s", ckpt)
         vocab, merges = _load_checkpoint(ckpt)
         next_id = max(vocab.keys(), default=-1) + 1
         for left, right in merges:
             _merge_pair_all_words(words, left, right, left + right)
+        _log.info("[checkpoint] replayed %d merges", len(merges))
     else:
         vocab = _build_initial_vocab(special_tokens)
         merges = []
@@ -1130,6 +1166,7 @@ def train_bpe(
     if num_workers is None:
         num_workers = (os.cpu_count() or 1) + 1
     use_parallel = num_workers > 1 and remaining > 0 and len(words) >= _PARALLEL_WORD_THRESHOLD
+    _log.info("[merge] target=%d merges, workers=%s, parallel=%s", merges_target, num_workers, use_parallel)
 
     if use_parallel:
         try:
@@ -1181,6 +1218,13 @@ def train_bpe(
                 merge_iters_executed += 1
                 avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed
 
+                _par_log_interval = max(1, merges_target // 20)
+                if iter_no == 1 or iter_no % _par_log_interval == 0 or iter_no == merges_target:
+                    _log.info(
+                        "[merge] %d/%d (%.0f%%) avg=%.1fms/iter [parallel]",
+                        iter_no, merges_target, 100.0 * iter_no / max(merges_target, 1), avg_merge_wall_ms,
+                    )
+
                 if callable(metrics_callback):
                     metrics_callback(
                         {
@@ -1229,6 +1273,14 @@ def train_bpe(
             cumulative_iter_wall_ms += iter_wall_ms
             merge_iters_executed += 1
             avg_merge_wall_ms = cumulative_iter_wall_ms / merge_iters_executed
+
+            _ser_log_interval = max(1, merges_target // 20)
+            if iter_no == 1 or iter_no % _ser_log_interval == 0 or iter_no == merges_target:
+                _log.info(
+                    "[merge] %d/%d (%.0f%%) avg=%.1fms/iter [serial]",
+                    iter_no, merges_target, 100.0 * iter_no / max(merges_target, 1), avg_merge_wall_ms,
+                )
+
             if callable(metrics_callback):
                 metrics_callback(
                     {
@@ -1270,12 +1322,18 @@ def train_bpe(
             }
         )
 
+    _log.info(
+        "train_bpe done: vocab_size=%d, merges=%d, total_merge_time=%.1fs",
+        len(vocab), len(merges), cumulative_iter_wall_ms / 1000.0,
+    )
+
     if _profiler is not None:
         _profiler.disable()
         _prof_dir = Path(profile_dir)  # type: ignore[arg-type]
         _prof_dir.mkdir(parents=True, exist_ok=True)
         _prof_file = _prof_dir / f"train_bpe_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.prof"
         _profiler.dump_stats(str(_prof_file))
+        _log.info("[profile] saved to %s", _prof_file)
         if callable(metrics_callback):
             metrics_callback({"event": "profile_saved", "path": str(_prof_file)})
 

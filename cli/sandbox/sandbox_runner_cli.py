@@ -14,16 +14,21 @@ sandbox_runner_cli：在 docker 沙盒内执行项目子命令并采集监控数
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import uuid
 from pathlib import Path
 
 # 运行 `python cli/.../xxx_cli.py` 时，`sys.path[0]` 指向脚本目录，
 # 需要显式把项目根目录加入 sys.path，才能导入真实包。
-_project_root = Path(__file__).resolve().parents[3]
+#
+# 本文件路径为：<project_root>/cli/sandbox/sandbox_runner_cli.py
+# 因此 project_root = parents[2]。
+_project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
 from llm_from_scratch.sandbox.sandbox_runner import SandboxRunConfig, run_sandbox  # noqa: E402
+from llm_from_scratch._logging import configure_cli_stdout_and_src_file_logging  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -95,13 +100,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.cmd:
         parser.error("missing command: provide a command after `--`")
 
+    # argparse.REMAINDER 会把分隔符 `--` 也包含进列表；这里去掉，避免容器侧再出现 `-- -- cmd`。
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+
     run_id = args.run_id or str(uuid.uuid4())
-    output_root = Path(args.output_root) if args.output_root else (_project_root / "runs")
-    data_dir = Path(args.data_dir) if args.data_dir else (_project_root / "data")
-    dockerfile = Path(args.dockerfile) if args.dockerfile else (_project_root / "docker" / "Dockerfile.sandbox")
+    output_root = (Path(args.output_root) if args.output_root else (_project_root / "runs")).resolve()
+    data_dir = (Path(args.data_dir) if args.data_dir else (_project_root / "data")).resolve()
+    dockerfile = (Path(args.dockerfile) if args.dockerfile else (_project_root / "docker" / "Dockerfile.sandbox")).resolve()
+
+    src_log_path = (output_root / run_id / "logs" / "src.log").resolve()
+    cli_log = configure_cli_stdout_and_src_file_logging(
+        src_log_path=src_log_path,
+        cli_logger_name="cli.sandbox.sandbox_runner",
+        level=logging.INFO,
+    )
 
     cfg = SandboxRunConfig(
-        cmd=args.cmd,
+        cmd=cmd,
         cpu=args.cpu,
         memory=args.memory,
         run_id=run_id,
@@ -116,14 +133,22 @@ def main(argv: list[str] | None = None) -> int:
         metrics_interval_s=args.metrics_interval_s,
     )
 
-    result = run_sandbox(cfg)
+    def _log(msg: str) -> None:
+        # run_sandbox expects a callable; we keep it line-based for streaming output.
+        cli_log.info("%s", msg.rstrip("\n"))
 
-    print(f"run_id: {cfg.run_id}")
-    print(f"output_dir: {result.run_dir}")
-    print("docker_build_cmd: " + " ".join(result.docker_build_cmd))
-    print("docker_run_cmd: " + " ".join(result.docker_run_cmd))
+    cli_log.info("sandbox_runner_cli start: run_id=%s cpu=%s memory=%s", run_id, cfg.cpu, cfg.memory)
+    cli_log.info("cmd: %s", " ".join(cmd))
+    cli_log.info("output: %s", output_root / run_id)
+    cli_log.info("metrics: http://localhost:%d/metrics", args.metrics_host_port)
+    cli_log.info("src logs -> %s", src_log_path)
 
-    # dry-run / success：直接透传 exit code（dry-run 固定为 0）
+    result = run_sandbox(cfg, log=_log)
+
+    cli_log.info("exit_code: %s", result.exit_code)
+    cli_log.info("logs: %s", result.logs_dir / "command.log")
+    cli_log.info("metrics: %s", result.metrics_dir / "metrics.prom")
+
     return int(result.exit_code or 0)
 
 

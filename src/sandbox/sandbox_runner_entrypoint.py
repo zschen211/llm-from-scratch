@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 from llm_from_scratch.sandbox.sandbox_runner_metrics import PrometheusMetricsCollector
+from llm_from_scratch._logging import configure_src_stdout_logging
+
+_log = logging.getLogger(__name__)
 
 
 def _ensure_dirs(out_dir: Path) -> tuple[Path, Path, Path]:
@@ -45,11 +49,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--metrics-port", type=int, default=8000)
     parser.add_argument("--metrics-path", required=True)
     parser.add_argument("--metrics-interval-s", type=float, default=1.0)
-    parser.add_argument("--", dest="cmd", nargs=argparse.REMAINDER)
+    # 用户命令：用标准的 REMAINDER 接收（由调用方通过 `--` 与本入口参数分隔）
+    parser.add_argument("cmd", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
 
-    if not args.cmd:
-        print("Error: no command provided after '--'.", file=sys.stderr)
+    # If someone runs this file directly, we want src logs visible on stdout.
+    configure_src_stdout_logging(level=logging.INFO)
+
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+
+    if not cmd:
+        _log.error("no command provided")
         return 2
 
     out_dir = Path(args.out_dir).resolve()
@@ -68,15 +80,21 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     metrics_collector.start()
+    _log.info("metrics collector started: port=%d path=%s interval=%.2fs", args.metrics_port, args.metrics_path, args.metrics_interval_s)
 
-    # 默认在 /workspace 下执行，这也是项目源码/CLI 常见相对路径基准。
+    # 容器内默认在 /workspace 下执行；如果直接在宿主机跑本脚本（调试），
+    # 则回退到当前工作目录，避免 /workspace 不存在导致失败。
     cwd = Path("/workspace")
+    if not cwd.is_dir():
+        cwd = Path.cwd()
     log_path = logs_dir / "command.log"
 
     try:
-        exit_code = _run_command_and_log(args.cmd, log_path=log_path, cwd=cwd)
+        _log.info("running command: %s", " ".join(cmd))
+        exit_code = _run_command_and_log(cmd, log_path=log_path, cwd=cwd)
     finally:
         metrics_collector.stop()
+        _log.info("metrics collector stopped")
 
     # 把 exit code 记录下来，便于后处理。
     (out_dir / "exit_code.txt").write_text(str(exit_code), encoding="utf-8")

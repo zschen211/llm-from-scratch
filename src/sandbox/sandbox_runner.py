@@ -3,8 +3,10 @@ from __future__ import annotations
 import dataclasses
 import shlex
 import subprocess
+import sys
 import uuid
 from pathlib import Path
+from typing import Callable
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,6 +84,9 @@ def assemble_docker_build_cmd(cfg: SandboxRunConfig) -> list[str]:
     return [
         "docker",
         "build",
+        # 在部分 WSL/公司网络环境下，buildkit 阶段容器可能无法解析 DNS。
+        # 使用 host network 可复用宿主机的网络与 DNS 配置，提升构建成功率。
+        "--network=host",
         "-t",
         cfg.image_tag,
         "-f",
@@ -145,7 +150,39 @@ def assemble_docker_run_cmd(cfg: SandboxRunConfig, run_dir: Path) -> list[str]:
     return docker_cmd
 
 
-def run_sandbox(cfg: SandboxRunConfig) -> SandboxRunResult:
+def _run_streaming(
+    cmd: list[str],
+    cwd: str,
+    log: Callable[[str], None] | None = None,
+) -> tuple[int, str, str]:
+    """运行子进程并实时流式输出 stdout/stderr，同时收集到字符串中返回。"""
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    lines: list[str] = []
+    for line in proc.stdout:
+        lines.append(line)
+        if log:
+            log(line)
+        else:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    rc = proc.wait()
+    return rc, "".join(lines), ""
+
+
+def run_sandbox(
+    cfg: SandboxRunConfig,
+    log: Callable[[str], None] | None = None,
+) -> SandboxRunResult:
+    _log = log or (lambda s: (sys.stderr.write(s), sys.stderr.flush()))
+
     run_dir, metrics_dir, logs_dir, prof_dir = prepare_run_dirs(cfg)
 
     docker_build_cmd = assemble_docker_build_cmd(cfg)
@@ -169,26 +206,20 @@ def run_sandbox(cfg: SandboxRunConfig) -> SandboxRunResult:
         )
 
     if cfg.build_image:
-        proc_build = subprocess.run(
-            docker_build_cmd,
-            cwd=str(cfg.project_root),
-            capture_output=True,
-            text=True,
-        )
-        if proc_build.returncode != 0:
+        _log("[sandbox] docker build starting ...\n")
+        rc, stdout, stderr = _run_streaming(docker_build_cmd, cwd=str(cfg.project_root), log=log)
+        if rc != 0:
             raise RuntimeError(
                 "docker build failed:\n"
                 f"cmd: {_quote_cmd(docker_build_cmd)}\n"
-                f"stdout:\n{proc_build.stdout}\n"
-                f"stderr:\n{proc_build.stderr}\n"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}\n"
             )
+        _log("[sandbox] docker build done.\n")
 
-    proc_run = subprocess.run(
-        docker_run_cmd,
-        cwd=str(cfg.project_root),
-        capture_output=True,
-        text=True,
-    )
+    _log("[sandbox] docker run starting ...\n")
+    rc, stdout, stderr = _run_streaming(docker_run_cmd, cwd=str(cfg.project_root), log=log)
+    _log(f"[sandbox] docker run finished (exit_code={rc}).\n")
 
     return SandboxRunResult(
         run_dir=run_dir,
@@ -197,9 +228,9 @@ def run_sandbox(cfg: SandboxRunConfig) -> SandboxRunResult:
         prof_dir=prof_dir,
         docker_build_cmd=docker_build_cmd,
         docker_run_cmd=docker_run_cmd,
-        exit_code=proc_run.returncode,
-        stdout=proc_run.stdout,
-        stderr=proc_run.stderr,
+        exit_code=rc,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 

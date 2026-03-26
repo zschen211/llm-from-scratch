@@ -1,0 +1,15 @@
+# TYPE sandbox_cpu_usage_seconds_total counter
+sandbox_cpu_usage_seconds_total{run_id="773d09b1-6f79-472f-909a-cbf865c5fa7c"} 0.070534
+# TYPE sandbox_cpu_usage_rate gauge
+# TYPE sandbox_memory_bytes gauge
+sandbox_memory_bytes{run_id="773d09b1-6f79-472f-909a-cbf865c5fa7c"} 20660224
+# TYPE sandbox_memory_max_bytes gauge
+sandbox_memory_max_bytes{run_id="773d09b1-6f79-472f-909a-cbf865c5fa7c"} 536870912
+# TYPE sandbox_threads_count gauge
+sandbox_threads_count{run_id="773d09b1-6f79-472f-909a-cbf865c5fa7c"} 4
+# TYPE sandbox_pids_current gauge
+sandbox_pids_current{run_id="773d09b1-6f79-472f-909a-cbf865c5fa7c"} 4
+# TYPE sandbox_now_timestamp_seconds gauge
+sandbox_now_timestamp_seconds{run_id="773d09b1-6f79-472f-909a-cbf865c5fa7c"} 1774528721.898502
+# TYPE sandbox_cpu_limit gauge
+sandbox_cpu_limit{run_id="773d09b1-6f79-472f-909a-cbf865c5fa7c"} 1.0

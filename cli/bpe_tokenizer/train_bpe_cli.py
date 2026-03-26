@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ _project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
 from llm_from_scratch.bpe_tokenizer import train_bpe
+from llm_from_scratch._logging import configure_cli_stdout_and_src_file_logging
 
 
 def _save_checkpoint(path: Path, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]]) -> None:
@@ -86,6 +88,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    src_log_path = Path(args.out).with_suffix(".src.log")
+    cli_log = configure_cli_stdout_and_src_file_logging(
+        src_log_path=src_log_path,
+        cli_logger_name="cli.bpe_tokenizer.train_bpe",
+        level=logging.INFO,
+    )
+    cli_log.info("train_bpe_cli start: input=%s vocab_size=%d out=%s", args.input_corpus, args.vocab_size, args.out)
+    cli_log.info("src logs -> %s", src_log_path)
+
     # Progress state. Kept in a dict to avoid Python scoping/nonlocal complexity.
     _progress_state: dict[str, Any] = {
         "pretok_start_t": None,
@@ -108,10 +119,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_print_metrics:
             return
         if newline:
-            print(line, file=sys.stderr, flush=True)
+            print(line, file=sys.stdout, flush=True)
             return
-        sys.stderr.write("\r" + line + " " * 8)
-        sys.stderr.flush()
+        sys.stdout.write("\r" + line + " " * 8)
+        sys.stdout.flush()
 
     label_width = 12  # 让进度条 '[' 在 pretok/merge 两行对齐
 
@@ -119,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         event = metrics.get("event")
 
         if event == "profile_saved":
-            print(f"[profile] saved: {metrics.get('path')}", flush=True)
+            cli_log.info("profile saved: %s", metrics.get("path"))
             return
 
         if args.no_print_metrics:
@@ -267,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     _save_checkpoint(Path(args.out), vocab=vocab, merges=merges)
+    cli_log.info("train_bpe_cli done")
     return 0
 
 

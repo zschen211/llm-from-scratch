@@ -1,0 +1,15 @@
+# TYPE sandbox_cpu_usage_seconds_total counter
+sandbox_cpu_usage_seconds_total{run_id="tmp3"} 0.068985
+# TYPE sandbox_cpu_usage_rate gauge
+# TYPE sandbox_memory_bytes gauge
+sandbox_memory_bytes{run_id="tmp3"} 13996032
+# TYPE sandbox_memory_max_bytes gauge
+sandbox_memory_max_bytes{run_id="tmp3"} 536870912
+# TYPE sandbox_threads_count gauge
+sandbox_threads_count{run_id="tmp3"} 4
+# TYPE sandbox_pids_current gauge
+sandbox_pids_current{run_id="tmp3"} 4
+# TYPE sandbox_now_timestamp_seconds gauge
+sandbox_now_timestamp_seconds{run_id="tmp3"} 1774527495.975070
+# TYPE sandbox_cpu_limit gauge
+sandbox_cpu_limit{run_id="tmp3"} 1.0

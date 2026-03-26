@@ -8,6 +8,8 @@
 
 ## 快速开始
 
+> 说明：若你的环境无法直连 Docker Hub，本仓库已在 `monitoring/docker-compose.yml` 中将镜像地址切换为国内镜像代理前缀（`docker.m.daocloud.io/...`）。
+
 1. 启动沙盒（示例）：
 
    ```bash
@@ -24,7 +26,7 @@
 
    ```bash
    cd monitoring
-   docker compose up -d
+   sudo docker compose up -d
    ```
 
 3. 打开 Grafana：
