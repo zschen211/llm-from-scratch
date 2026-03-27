@@ -8,7 +8,7 @@ from pathlib import Path
 # `cli-tests/llm_from_scratch/`（会与可编辑安装的 `llm_from_scratch` 发生命名空间合并），
 # 故实际路径为 `cli-tests/cli/llm_from_scratch/...`。
 # 仍将项目根目录插到 sys.path 最前面，确保导入落到真实实现。
-_project_root = Path(__file__).resolve().parents[4]
+_project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
 from llm_from_scratch.bpe_tokenizer import make_tokenizer, train_bpe

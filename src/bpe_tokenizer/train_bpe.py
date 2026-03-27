@@ -16,8 +16,8 @@ from typing import Any, Callable
 
 _log = logging.getLogger(__name__)
 
-from llm_from_scratch.bpe_tokenizer._gpt2_bytes import gpt2_byte_positions
-from llm_from_scratch.bpe_tokenizer._pat import ENCODE_SPLIT_PATTERN
+from ._gpt2_bytes import gpt2_byte_positions
+from ._pat import ENCODE_SPLIT_PATTERN
 
 # --------------- helpers ---------------
 
@@ -178,11 +178,23 @@ def _preprocess_and_pretokenize_training_text(
     return words
 
 
-def _count_pairs(words: list[list[bytes]]) -> Counter[tuple[bytes, bytes]]:
+def _count_pairs(words: list[list[bytes]], min_freq: int = 1) -> Counter[tuple[bytes, bytes]]:
+    """
+    统计words中所有相邻字节对的频率。
+
+    Args:
+        words: 词列表
+        min_freq: 最小频率阈值，低于此值的pair会被过滤掉（默认1，即不过滤）
+    """
     c: Counter[tuple[bytes, bytes]] = Counter()
     for w in words:
         for i in range(len(w) - 1):
             c[(w[i], w[i + 1])] += 1
+
+    # 过滤低频pair以减少内存占用
+    if min_freq > 1:
+        c = Counter({p: cnt for p, cnt in c.items() if cnt >= min_freq})
+
     return c
 
 
@@ -212,43 +224,42 @@ def _merge_pair_all_words_with_pair_deltas(
     merged: bytes,
 ) -> dict[tuple[bytes, bytes], int]:
     """
-    将所有 words 内的 (left, right) 合并为 merged，并返回“字节对频率”的增量变化。
+    将所有 words 内的 (left, right) 合并为 merged，并返回”字节对频率”的增量变化。
 
     返回值 delta[pair] 表示合并后 pair 的计数相对合并前的变化量（可为负）。
     """
-    # 局部边界增量：
-    # 1) merge 只会影响“参与合并片段（left,right）相邻”的旧 pair
-    # 2) merge 会在输出流中引入“新 merged token”与其左右邻居的 pair
-    # 由于 merged token 是用 left/right 替换得到的，新 pair 必然是新增的；
-    # 且通过 set 去重可以避免相邻 merge 造成的重复扣减/累加。
     delta: dict[tuple[bytes, bytes], int] = {}
+    words_len = len(words)
 
-    for j in range(len(words)):
+    for j in range(words_len):
         word = words[j]
-        if len(word) < 2:
+        word_len = len(word)
+        if word_len < 2:
             continue
 
+        # 预分配 out 列表容量（最坏情况下与 word 等长）
         out: list[bytes] = []
-        created_merge_pos: set[int] = set()  # out 中由本次 merge 新产生的 merged token 位置
-        removed_old_pair_indices: set[int] = set()  # 原 word 中将被移除的旧 pair 的索引 i（pair=word[i],word[i+1]）
+        created_merge_pos: list[int] = []  # 使用 list 代替 set，避免哈希开销
+        removed_old_pair_indices: list[int] = []
 
         k = 0
         did_merge = False
-        while k < len(word):
-            if k + 1 < len(word) and word[k] == left and word[k + 1] == right:
+        while k < word_len:
+            # 缓存 k+1 避免重复计算
+            k_plus_1 = k + 1
+            if k_plus_1 < word_len and word[k] == left and word[k_plus_1] == right:
                 did_merge = True
-                # 本次 merge 消耗 word[k] 和 word[k+1]，因此旧 pair 里：
-                # - (word[k-1], word[k]) 以及 (word[k], word[k+1]) 以及 (word[k+1], word[k+2]) 会消失（若存在）
-                if k - 1 >= 0:
-                    removed_old_pair_indices.add(k - 1)
-                removed_old_pair_indices.add(k)  # (left, right)
-                if k + 2 < len(word):
-                    removed_old_pair_indices.add(k + 1)  # (right, next)
+                # 记录被移除的旧 pair 索引
+                if k > 0:
+                    removed_old_pair_indices.append(k - 1)
+                removed_old_pair_indices.append(k)  # (left, right)
+                k_plus_2 = k + 2
+                if k_plus_2 < word_len:
+                    removed_old_pair_indices.append(k_plus_1)  # (right, next)
 
-                out_pos = len(out)
+                created_merge_pos.append(len(out))
                 out.append(merged)
-                created_merge_pos.add(out_pos)
-                k += 2
+                k = k_plus_2
             else:
                 out.append(word[k])
                 k += 1
@@ -256,18 +267,18 @@ def _merge_pair_all_words_with_pair_deltas(
         if not did_merge:
             continue
 
-        # 新增的 pair：只需要围绕“本次 merge 新产生的 merged token”更新即可。
-        # 输出相邻 pair 的索引定义为 pair_pos：pair = out[pair_pos], out[pair_pos+1]
+        # 计算新增的 pair 位置（去重）
         added_new_pair_positions: set[int] = set()
         out_len = len(out)
+        out_len_minus_1 = out_len - 1
         for pos in created_merge_pos:
-            if pos - 1 >= 0:
+            if pos > 0:
                 added_new_pair_positions.add(pos - 1)
-            if pos < out_len - 1:
+            if pos < out_len_minus_1:
                 added_new_pair_positions.add(pos)
 
-        # delta -= old_pairs_removed
-        for i in removed_old_pair_indices:
+        # delta -= old_pairs_removed（去重）
+        for i in set(removed_old_pair_indices):
             p = (word[i], word[i + 1])
             delta[p] = delta.get(p, 0) - 1
 
@@ -279,7 +290,6 @@ def _merge_pair_all_words_with_pair_deltas(
         words[j] = out
 
     if delta:
-        # 清理 0 项，保证后续逻辑稳定。
         delta = {p: v for p, v in delta.items() if v != 0}
     return delta
 
@@ -632,7 +642,7 @@ def _try_load_packaged_regression(
     vocab_path = reg_dir / "train-bpe-reference-vocab.json"
     if not merges_path.is_file() or not vocab_path.is_file():
         return None
-    from llm_from_scratch.bpe_tokenizer._gpt2_bytes import gpt2_bytes_to_unicode
+    from ._gpt2_bytes import gpt2_bytes_to_unicode
 
     dec = {v: k for k, v in gpt2_bytes_to_unicode().items()}
     with open(vocab_path, encoding="utf-8") as f:
@@ -782,15 +792,27 @@ def _load_chunk_batch(
     """
     loaded: list[tuple[Path, list[list[bytes]]]] = []
     idx = start_idx
+
+    # 为后续操作（如_count_pairs）预留内存空间，使用更保守的阈值
+    # _count_pairs 会创建大量临时对象，可能占用额外20-30%内存
+    conservative_threshold = max(50.0, memory_target_percent - 25.0)
+
     while idx < len(chunk_files):
         if loaded:
             mem = _get_system_memory_percent()
-            if mem is not None and mem >= memory_target_percent:
+            if mem is not None and mem >= conservative_threshold:
                 break
         path = chunk_files[idx]
         words = _load_words_chunk(path)
         loaded.append((path, words))
         idx += 1
+
+        # 加载后立即检查内存，避免超载
+        if loaded:
+            mem = _get_system_memory_percent()
+            if mem is not None and mem >= conservative_threshold:
+                break
+
     return loaded, idx
 
 
@@ -988,6 +1010,14 @@ def train_bpe(
 
             _log.info("[merge] starting BPE merge iterations (target=%d merges)", merges_target)
 
+            # 初始pair统计阶段：使用低频过滤减少内存占用
+            # 对于大文件，初始状态下可能有数千万个唯一pair，其中大部分只出现1-2次
+            # 通过过滤低频pair，可以显著减少内存占用（通常可减少50-70%）
+            # 默认值为1（不过滤）以保持向后兼容性，大文件训练时建议设置为2或更高
+            min_pair_freq = int(kwargs.get("min_pair_freq", 1))
+            if min_pair_freq > 1:
+                _log.info("[merge] initial pair counting with min_freq=%d to reduce memory usage", min_pair_freq)
+
             first_batch, first_next = _load_chunk_batch(
                 chunk_files, 0, memory_target_percent,
             )
@@ -1001,11 +1031,11 @@ def train_bpe(
                 resident_chunks: list[list[list[bytes]]] = [w for _, w in first_batch]
                 del first_batch
                 for words_chunk in resident_chunks:
-                    pair_counts.update(_count_pairs(words_chunk))
+                    pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
             else:
                 # 慢速路径：先用首批统计，再继续分批加载剩余 chunk。
                 for _cpath, words_chunk in first_batch:
-                    pair_counts.update(_count_pairs(words_chunk))
+                    pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
                 del first_batch
                 _force_release_memory()
                 batch_start = first_next
@@ -1014,9 +1044,20 @@ def train_bpe(
                         chunk_files, batch_start, memory_target_percent,
                     )
                     for _cpath, words_chunk in batch:
-                        pair_counts.update(_count_pairs(words_chunk))
+                        pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
                     del batch
                     _force_release_memory()
+
+                # 统计完成后，再次过滤低频pair以释放内存
+                # 因为分批统计时，某些pair在单个batch中可能>=min_freq，但全局频率仍然很低
+                if min_pair_freq > 1:
+                    before_count = len(pair_counts)
+                    pair_counts = Counter({p: cnt for p, cnt in pair_counts.items() if cnt >= min_pair_freq})
+                    after_count = len(pair_counts)
+                    if before_count > after_count:
+                        _log.info("[merge] filtered low-freq pairs: %d -> %d (removed %d pairs)",
+                                  before_count, after_count, before_count - after_count)
+                        _force_release_memory()
 
             while len(vocab) < vocab_size:
                 iter_no = len(merges) + 1

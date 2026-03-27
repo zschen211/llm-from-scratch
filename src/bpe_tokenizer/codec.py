@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 
-from llm_from_scratch.bpe_tokenizer._pat import ENCODE_SPLIT_PATTERN
+from ._pat import ENCODE_SPLIT_PATTERN
 
 
 class BPETokenizer:

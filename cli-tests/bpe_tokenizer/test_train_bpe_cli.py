@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-_project_root = Path(__file__).resolve().parents[4]
+_project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_project_root))
 
 from llm_from_scratch.bpe_tokenizer import train_bpe  # noqa: E402

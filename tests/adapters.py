@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
     class Tensor:  # type: ignore[no-redef]
         pass
-from llm_from_scratch.bpe_tokenizer import make_tokenizer, train_bpe
+from src.bpe_tokenizer import make_tokenizer, train_bpe
 try:
     from jaxtyping import Bool, Float, Int
 except ModuleNotFoundError:  # pragma: no cover

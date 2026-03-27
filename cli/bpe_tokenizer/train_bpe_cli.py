@@ -85,6 +85,14 @@ def main(argv: list[str] | None = None) -> int:
         default=85.0,
         help="Memory usage threshold (0-100) for chunk spilling during stream mode (default: 85).",
     )
+    parser.add_argument(
+        "--min-pair-freq",
+        type=int,
+        default=1,
+        help="Minimum pair frequency threshold for initial pair counting (default: 1). "
+             "Set to 2 or higher for large files to reduce memory usage. "
+             "Default is 1 to maintain backward compatibility.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -275,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         profile_dir=profile_dir,
         stream_chunk_chars=args.stream_chunk_chars,
         stream_memory_target_percent=args.stream_memory_target_percent,
+        min_pair_freq=args.min_pair_freq,
     )
 
     _save_checkpoint(Path(args.out), vocab=vocab, merges=merges)
