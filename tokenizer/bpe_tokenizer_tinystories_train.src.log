@@ -1,0 +1,2 @@
+16:04:44 INFO llm_from_scratch.bpe_tokenizer.train_bpe train_bpe start: input=TinyStoriesV2-GPT4-train.txt (2124.6 MB), vocab_size=10000, special_tokens=1, mode=streaming
+16:04:44 INFO llm_from_scratch.bpe_tokenizer.train_bpe [pretokenize] streaming pretokenization starting (chunk_chars=1000000, mem_threshold=65%)
