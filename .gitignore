@@ -1,4 +1,5 @@
 data/
+runs/
 
 # Python
 __pycache__/
@@ -11,3 +12,4 @@ __pycache__/
 venv/
 .prof/
 llm_from_scratch.egg-info/
+
