@@ -22,6 +22,21 @@ _log = logging.getLogger(__name__)
 from ._gpt2_bytes import gpt2_byte_positions
 from ._pat import ENCODE_SPLIT_PATTERN
 
+# 尝试导入 Rust 加速模块
+try:
+    from ._rust_bridge import (
+        RUST_AVAILABLE,
+        WordsChunkWithIndex,
+        count_pairs as rust_count_pairs,
+        merge_pair_all_words_with_deltas as rust_merge_pair_all_words_with_deltas,
+    )
+
+    if RUST_AVAILABLE:
+        _log.info("Rust acceleration enabled for BPE training")
+except ImportError:
+    RUST_AVAILABLE = False
+    _log.info("Rust acceleration not available, using Python implementation")
+
 # --------------- helpers ---------------
 
 
@@ -189,6 +204,12 @@ def _count_pairs(words: list[list[bytes]], min_freq: int = 1) -> Counter[tuple[b
         words: 词列表
         min_freq: 最小频率阈值，低于此值的pair会被过滤掉（默认1，即不过滤）
     """
+    # 优先使用 Rust 实现
+    if RUST_AVAILABLE:
+        result = rust_count_pairs(words, min_freq)
+        return Counter(result)
+
+    # 回退到 Python 实现
     c: Counter[tuple[bytes, bytes]] = Counter()
     for w in words:
         for i in range(len(w) - 1):
@@ -227,10 +248,15 @@ def _merge_pair_all_words_with_pair_deltas(
     merged: bytes,
 ) -> dict[tuple[bytes, bytes], int]:
     """
-    将所有 words 内的 (left, right) 合并为 merged，并返回”字节对频率”的增量变化。
+    将所有 words 内的 (left, right) 合并为 merged，并返回「字节对频率」的增量变化。
 
     返回值 delta[pair] 表示合并后 pair 的计数相对合并前的变化量（可为负）。
     """
+    # 优先使用 Rust 实现
+    if RUST_AVAILABLE:
+        return rust_merge_pair_all_words_with_deltas(words, left, right, merged)
+
+    # 回退到 Python 实现
     delta: dict[tuple[bytes, bytes], int] = {}
     words_len = len(words)
 
