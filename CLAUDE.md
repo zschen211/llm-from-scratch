@@ -60,11 +60,9 @@ uv run pytest tests/test_train_bpe.py::test_train_bpe -q
 ### 核心模块
 
 1. **train_bpe.py** - BPE 训练实现
-   - `train_bpe()` - 主训练函数，支持多进程并行、流式处理、checkpoint 恢复
+   - `train_bpe()` - 主训练函数，支持多进程并行、流式处理
    - 三阶段流程：数据预处理 → 数据预分词 → 字节对合并迭代
-   - 支持两种模式：
-     - 内存模式（`stream_chunk_chars=0`）：一次性加载全部数据
-     - 流式模式（默认）：分块读取、内存占用达阈值时落盘
+   - 统一使用流式模式：分块读取、内存占用达阈值时落盘
 
 2. **codec.py** - 编解码实现
    - `BPETokenizer` 类：支持 `encode()`, `decode()`, `encode_iterable()`
@@ -77,14 +75,15 @@ uv run pytest tests/test_train_bpe.py::test_train_bpe -q
 ### 多进程并行架构
 
 - **预分词阶段**：文档分块通过队列分发给多个 worker 进程并行处理
-- **合并迭代阶段**：使用 `_BPEWorkerPool` 管理持久化 worker
-  - 每个 worker 持有一段 words 切片
+- **合并迭代阶段**：使用 `_BPEStreamWorkerPool` 管理持久化 worker
+  - 将 chunk 文件列表分配给各个 worker
+  - 每个 worker 负责处理自己的 chunk 文件
   - 通过轻量命令控制：`"count"` / `("merge_delta", l, r, m)` / `"stop"`
   - 增量更新优化：每次 merge 只返回频率增量 delta，避免全量重算
 
 ### 流式处理机制
 
-当输入文件较大时，启用流式模式：
+流式模式统一用于所有训练：
 1. 顺序读取文件，按 `stream_chunk_chars` 字符分块
 2. 在 special token 边界对齐，避免截断
 3. 预分词后累积到内存，达到 `stream_memory_target_percent` 阈值时落盘
@@ -174,19 +173,19 @@ python cli/bpe_tokenizer/train_bpe_cli.py \
 
 ### Checkpoint 机制
 - 训练过程中每次 merge 后可写入 checkpoint（JSON 格式）
-- 支持从 checkpoint 恢复训练（仅内存模式）
+- 流式模式暂不支持 checkpoint 恢复
 - Checkpoint 包含 vocab 和 merges 完整状态
 
 ## 常见问题
 
 ### 内存不足
-- 使用流式模式：`--stream-chunk-chars 1000000`
-- 调整内存阈值：`--stream-memory-target-percent 70`
+- 调整分块大小：`--stream-chunk-chars 500000`（默认 1000000）
+- 调整内存阈值：`--stream-memory-target-percent 70`（默认 85）
 - 减少并行度：`--num-workers 2`
 
 ### 性能优化
-- 大文件（>100MB）自动启用流式模式
-- 小文件（<5000 words）自动禁用多进程
+- 流式模式统一用于所有训练
+- 如果所有 chunk 能加载到内存，自动在内存中处理
 - 可通过 `--num-workers 1` 强制串行（便于调试）
 
 ### 测试失败

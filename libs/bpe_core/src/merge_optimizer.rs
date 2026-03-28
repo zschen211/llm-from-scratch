@@ -14,16 +14,16 @@ pub struct WordsChunkWithIndex {
 #[pymethods]
 impl WordsChunkWithIndex {
     #[new]
-    fn new(py: Python, words: &PyList) -> PyResult<Self> {
+    fn new(py: Python, words: &Bound<'_, PyList>) -> PyResult<Self> {
         // 转换 Python words 为 Rust 格式
         let rust_words: Vec<Vec<Vec<u8>>> = words
             .iter()
             .map(|word| {
-                let word_list: &PyList = word.extract()?;
+                let word_list: Bound<PyList> = word.downcast_into()?;
                 word_list
                     .iter()
                     .map(|token| {
-                        let bytes: &PyBytes = token.extract()?;
+                        let bytes: Bound<PyBytes> = token.downcast_into()?;
                         Ok(bytes.as_bytes().to_vec())
                     })
                     .collect::<PyResult<Vec<Vec<u8>>>>()
@@ -62,9 +62,9 @@ impl WordsChunkWithIndex {
     fn merge_pair_with_deltas(
         &mut self,
         py: Python,
-        left: &PyBytes,
-        right: &PyBytes,
-        merged: &PyBytes,
+        left: &Bound<'_, PyBytes>,
+        right: &Bound<'_, PyBytes>,
+        merged: &Bound<'_, PyBytes>,
     ) -> PyResult<PyObject> {
         if !self.index_built {
             self.build_index();
@@ -79,7 +79,7 @@ impl WordsChunkWithIndex {
         // 获取受影响的 word indices
         let affected_indices = match self.pair_index.get(&target_pair) {
             Some(indices) => indices.clone(),
-            None => return Ok(PyDict::new(py).into()),
+            None => return Ok(PyDict::new_bound(py).into()),
         };
 
         let mut delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
@@ -181,14 +181,14 @@ impl WordsChunkWithIndex {
         }
 
         // 转换 delta 回 Python dict
-        let result = PyDict::new(py);
+        let result = PyDict::new_bound(py);
         for ((left, right), count) in delta {
             if count != 0 {
-                let key = pyo3::types::PyTuple::new(
+                let key = pyo3::types::PyTuple::new_bound(
                     py,
                     &[
-                        PyBytes::new(py, &left).into(),
-                        PyBytes::new(py, &right).into(),
+                        PyBytes::new_bound(py, &left).into_any(),
+                        PyBytes::new_bound(py, &right).into_any(),
                     ],
                 );
                 result.set_item(key, count)?;
@@ -200,11 +200,11 @@ impl WordsChunkWithIndex {
 
     /// 获取 words（用于 Python 访问）
     fn get_words(&self, py: Python) -> PyResult<PyObject> {
-        let result = PyList::empty(py);
+        let result = PyList::empty_bound(py);
         for word in &self.words {
-            let py_word = PyList::empty(py);
+            let py_word = PyList::empty_bound(py);
             for token in word {
-                py_word.append(PyBytes::new(py, token))?;
+                py_word.append(PyBytes::new_bound(py, token))?;
             }
             result.append(py_word)?;
         }

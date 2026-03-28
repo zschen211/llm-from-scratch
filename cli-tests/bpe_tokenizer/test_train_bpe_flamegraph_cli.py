@@ -60,7 +60,7 @@ def test_train_bpe_cli_profile_generates_prof_file(run_cli, tmp_path: Path) -> N
     assert prof_dir.is_dir()
     prof_files = list(prof_dir.glob("*.prof"))
     assert len(prof_files) == 1
-    assert "[profile] saved:" in proc.stdout
+    assert "profile saved:" in proc.stdout
 
 
 def test_train_bpe_cli_profile_default_dir(run_cli, project_root: Path, tmp_path: Path) -> None:

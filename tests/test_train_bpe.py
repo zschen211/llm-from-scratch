@@ -68,10 +68,13 @@ def test_train_bpe_special_tokens(snapshot):
     merged with other tokens.
     """
     input_path = FIXTURES_PATH / "tinystories_sample_5M.txt"
+    # 快照在「全内存 + 无倒排索引」路径下录制；流式 + 内存阈值可能导致 chunk 边界随机器负载变化。
     vocab, merges = run_train_bpe(
         input_path=input_path,
         vocab_size=1000,
         special_tokens=["<|endoftext|>"],
+        stream_chunk_chars=0,
+        use_inverted_index=False,
     )
 
     # Check that the special token is not in the vocab

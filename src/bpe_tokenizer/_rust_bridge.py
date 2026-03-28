@@ -5,6 +5,23 @@
 
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger(__name__)
+
+# 各入口首次实际调用时打一条 INFO，便于确认运行时是否走到 Rust（需配置 logging 级别）。
+_dispatch_logged: set[str] = set()
+
+
+def _log_backend_once(op: str, *, rust: bool) -> None:
+    backend = "Rust (bpe_core)" if rust else "Python"
+    key = f"{op}:{backend}"
+    if key in _dispatch_logged:
+        return
+    _dispatch_logged.add(key)
+    _log.info("[_rust_bridge] 首次调用 %s -> %s", op, backend)
+
+
 try:
     # 尝试导入 Rust 实现
     from bpe_core import (
@@ -15,21 +32,29 @@ try:
     )
 
     RUST_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     RUST_AVAILABLE = False
     RustWordsChunkWithIndex = None
     rust_count_pairs = None
     rust_merge_pair_all_words_with_deltas = None
     rust_preprocess_and_pretokenize = None
+    _log.debug("bpe_core 导入失败，将使用 Python 回退: %s", e)
 
 # 如果 Rust 不可用，回退到 Python 实现
 if not RUST_AVAILABLE:
     from ._merge_optimizer import WordsChunkWithIndex as PythonWordsChunkWithIndex
-    from .train_bpe import (
+    from .train_bpe_merge import (
         _count_pairs as python_count_pairs,
-        _merge_pair_all_words_with_deltas as python_merge_pair_all_words_with_deltas,
+        _merge_pair_all_words_with_pair_deltas as python_merge_pair_all_words_with_deltas,
+    )
+    from .train_bpe_pretokenize import (
         _preprocess_and_pretokenize_training_text as python_preprocess_and_pretokenize,
     )
+
+if RUST_AVAILABLE:
+    _log.info("[_rust_bridge] bpe_core 已加载，本模块优先使用 Rust")
+else:
+    _log.info("[_rust_bridge] bpe_core 不可用，本模块使用 Python 实现")
 
 
 def count_pairs(words: list[list[bytes]], min_freq: int = 1) -> dict[tuple[bytes, bytes], int]:
@@ -37,6 +62,7 @@ def count_pairs(words: list[list[bytes]], min_freq: int = 1) -> dict[tuple[bytes
 
     优先使用 Rust 实现，如果不可用则回退到 Python 实现。
     """
+    _log_backend_once("count_pairs", rust=RUST_AVAILABLE)
     if RUST_AVAILABLE:
         return rust_count_pairs(words, min_freq)
     else:
@@ -53,6 +79,7 @@ def merge_pair_all_words_with_deltas(
 
     优先使用 Rust 实现，如果不可用则回退到 Python 实现。
     """
+    _log_backend_once("merge_pair_all_words_with_deltas", rust=RUST_AVAILABLE)
     if RUST_AVAILABLE:
         return rust_merge_pair_all_words_with_deltas(words, left, right, merged)
     else:
@@ -67,6 +94,7 @@ def preprocess_and_pretokenize(
 
     优先使用 Rust 实现，如果不可用则回退到 Python 实现。
     """
+    _log_backend_once("preprocess_and_pretokenize", rust=RUST_AVAILABLE)
     if RUST_AVAILABLE:
         return rust_preprocess_and_pretokenize(text, special_tokens)
     else:
@@ -83,6 +111,7 @@ class WordsChunkWithIndex:
     """
 
     def __init__(self, words: list[list[bytes]]):
+        _log_backend_once("WordsChunkWithIndex.__init__", rust=RUST_AVAILABLE)
         if RUST_AVAILABLE:
             self._impl = RustWordsChunkWithIndex(words)
             self._is_rust = True
@@ -93,6 +122,13 @@ class WordsChunkWithIndex:
     def build_index(self) -> None:
         """构建倒排索引。"""
         self._impl.build_index()
+
+    @property
+    def _index_built(self) -> bool:
+        """与 `_merge_optimizer.count_pairs_with_index` 兼容：Rust 侧在 merge 时会按需建索引。"""
+        if self._is_rust:
+            return True
+        return self._impl._index_built
 
     def merge_pair_with_deltas(
         self, left: bytes, right: bytes, merged: bytes
