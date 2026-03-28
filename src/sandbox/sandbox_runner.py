@@ -37,6 +37,10 @@ class SandboxRunConfig:
     build_image: bool = True
     metrics_interval_s: float = 1.0
 
+    # 传给 `docker run` 的额外能力。默认包含 PERFMON，便于容器内 `perf trace` 使用 perf_event_open。
+    # 若需最小权限，在 CLI 传 --no-sandbox-perf-caps，或在此处显式传入 docker_cap_add=()。
+    docker_cap_add: tuple[str, ...] = ("PERFMON",)
+
     # “你可以使用 Prometheus + Grafana”的前提是指标采用 Prometheus exposition format。
     # 这里容器内指标服务端口固定，host 通过 -p 映射到 metrics_host_port。
     container_metrics_port: int = 8000
@@ -116,6 +120,15 @@ def assemble_docker_run_cmd(cfg: SandboxRunConfig, run_dir: Path) -> list[str]:
         str(cfg.cpu),
         "--memory",
         cfg.memory,
+    ]
+    for cap in cfg.docker_cap_add:
+        docker_cmd.extend(["--cap-add", cap])
+    if "PERFMON" in cfg.docker_cap_add:
+        docker_cmd.extend([
+            "-v", "/sys/kernel/debug:/sys/kernel/debug:ro",
+            "-v", "/sys/kernel/tracing:/sys/kernel/tracing:ro",
+        ])
+    docker_cmd += [
         "-p",
         f"{cfg.metrics_host_port}:{cfg.container_metrics_port}",
         "-v",
@@ -134,6 +147,8 @@ def assemble_docker_run_cmd(cfg: SandboxRunConfig, run_dir: Path) -> list[str]:
         f"SANDBOX_METRICS_INTERVAL_S={str(cfg.metrics_interval_s)}",
         "-e",
         f"SANDBOX_CPU_LIMIT={str(cfg.cpu)}",
+    ]
+    docker_cmd += [
         cfg.image_tag,
         "--out-dir",
         container_out_dir,

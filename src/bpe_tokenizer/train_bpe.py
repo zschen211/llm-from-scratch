@@ -827,6 +827,8 @@ def train_bpe(
 
     kwargs:
         checkpoint_path: 每次 merge 后写入 checkpoint（JSON）。
+        checkpoint_every_n_merges: checkpoint 保存间隔（默认 1，即每轮保存）。
+            设为 10 表示每 10 轮 merge 保存一次；<=0 时等价于 1。
         force_restart: 为 True 时忽略已有 checkpoint 重新开始。
         disable_packaged_regression: 为 True 时不使用包内 corpus.en 参考结果。
         num_workers: 并行 worker 进程数；默认 cpu_count()+1，设为 1 禁用并行。
@@ -857,6 +859,7 @@ def train_bpe(
         _profiler.enable()
 
     checkpoint_path = kwargs.get("checkpoint_path")
+    checkpoint_every_n_merges = max(1, int(kwargs.get("checkpoint_every_n_merges", 1) or 1))
     force_restart = bool(kwargs.get("force_restart", False))
 
     metrics_callback: Callable[[dict[str, Any]], None] | None = kwargs.get("metrics_callback")
@@ -868,6 +871,7 @@ def train_bpe(
         "train_bpe start: input=%s (%.1f MB), vocab_size=%d, special_tokens=%d, mode=%s",
         input_path.name, file_size_mb, vocab_size, len(special_tokens), mode_label,
     )
+    _log.info("checkpoint policy: every %d merge(s)", checkpoint_every_n_merges)
 
     if stream_chunk_chars > 0:
 
@@ -1062,17 +1066,21 @@ def train_bpe(
             while len(vocab) < vocab_size:
                 iter_no = len(merges) + 1
                 iter_t0 = time.perf_counter()
+                pick_t0 = time.perf_counter()
+                io_ms = 0.0
 
                 if not pair_counts:
                     break
 
                 left, right = _pick_pair_to_merge(pair_counts)
+                pick_ms = 1000.0 * (time.perf_counter() - pick_t0)
                 merged = left + right
                 merges.append((left, right))
                 vocab[next_id] = merged
                 next_id += 1
 
                 iter_delta: dict[tuple[bytes, bytes], int] = {}
+                merge_t0 = time.perf_counter()
 
                 if all_in_memory:
                     for words_chunk in resident_chunks:
@@ -1084,28 +1092,37 @@ def train_bpe(
                 else:
                     batch_start = 0
                     while batch_start < len(chunk_files):
+                        io_t0 = time.perf_counter()
                         batch, batch_start = _load_chunk_batch(
                             chunk_files, batch_start, memory_target_percent,
                         )
+                        io_ms += 1000.0 * (time.perf_counter() - io_t0)
                         for cpath, words_chunk in batch:
                             delta = _merge_pair_all_words_with_pair_deltas(
                                 words_chunk, left, right, merged,
                             )
                             for p, d in delta.items():
                                 iter_delta[p] = iter_delta.get(p, 0) + d
+                            io_t0 = time.perf_counter()
                             _dump_words_chunk(cpath, words_chunk)
+                            io_ms += 1000.0 * (time.perf_counter() - io_t0)
                         del batch
                         _force_release_memory()
+                merge_ms = 1000.0 * (time.perf_counter() - merge_t0)
 
+                apply_t0 = time.perf_counter()
                 for p, d in iter_delta.items():
                     new_v = pair_counts.get(p, 0) + d
                     if new_v > 0:
                         pair_counts[p] = new_v
                     else:
                         pair_counts.pop(p, None)
+                apply_ms = 1000.0 * (time.perf_counter() - apply_t0)
 
-                if ckpt:
+                if ckpt and (iter_no % checkpoint_every_n_merges == 0 or len(vocab) >= vocab_size):
+                    io_t0 = time.perf_counter()
                     _save_checkpoint(ckpt, vocab, merges)
+                    io_ms += 1000.0 * (time.perf_counter() - io_t0)
 
                 iter_wall_ms = 1000.0 * (time.perf_counter() - iter_t0)
                 cumulative_iter_wall_ms += iter_wall_ms
@@ -1115,8 +1132,9 @@ def train_bpe(
                 _stream_merge_log_interval = max(1, merges_target // 20)
                 if iter_no == 1 or iter_no % _stream_merge_log_interval == 0 or iter_no == merges_target:
                     _log.info(
-                        "[merge] %d/%d (%.0f%%) avg=%.1fms/iter",
+                        "[merge] %d/%d (%.0f%%) avg=%.1fms/iter [pick=%.1fms merge=%.1fms apply=%.1fms io=%.1fms]",
                         iter_no, merges_target, 100.0 * iter_no / max(merges_target, 1), avg_merge_wall_ms,
+                        pick_ms, merge_ms, apply_ms, io_ms,
                     )
 
                 if callable(metrics_callback):
@@ -1238,22 +1256,31 @@ def train_bpe(
                 iter_t0 = time.perf_counter()
                 if not pair_counts:
                     break
+                pick_t0 = time.perf_counter()
                 left, right = _pick_pair_to_merge(pair_counts)
+                pick_ms = 1000.0 * (time.perf_counter() - pick_t0)
                 merged = left + right
                 merges.append((left, right))
                 vocab[next_id] = merged
                 next_id += 1
 
+                merge_t0 = time.perf_counter()
                 merge_delta, merge_metrics = pool.merge_pair_with_pair_deltas(left, right, merged)
+                merge_ms = 1000.0 * (time.perf_counter() - merge_t0)
+                apply_t0 = time.perf_counter()
                 for p, d in merge_delta.items():
                     new_v = pair_counts.get(p, 0) + d
                     if new_v > 0:
                         pair_counts[p] = new_v
                     else:
                         pair_counts.pop(p, None)
+                apply_ms = 1000.0 * (time.perf_counter() - apply_t0)
 
-                if ckpt:
+                io_ms = 0.0
+                if ckpt and (iter_no % checkpoint_every_n_merges == 0 or len(vocab) >= vocab_size):
+                    io_t0 = time.perf_counter()
                     _save_checkpoint(ckpt, vocab, merges)
+                    io_ms = 1000.0 * (time.perf_counter() - io_t0)
                 iter_wall_ms = 1000.0 * (time.perf_counter() - iter_t0)
                 cumulative_iter_wall_ms += iter_wall_ms
                 merge_iters_executed += 1
@@ -1262,8 +1289,9 @@ def train_bpe(
                 _par_log_interval = max(1, merges_target // 20)
                 if iter_no == 1 or iter_no % _par_log_interval == 0 or iter_no == merges_target:
                     _log.info(
-                        "[merge] %d/%d (%.0f%%) avg=%.1fms/iter [parallel]",
+                        "[merge] %d/%d (%.0f%%) avg=%.1fms/iter [parallel pick=%.1fms merge=%.1fms apply=%.1fms io=%.1fms]",
                         iter_no, merges_target, 100.0 * iter_no / max(merges_target, 1), avg_merge_wall_ms,
+                        pick_ms, merge_ms, apply_ms, io_ms,
                     )
 
                 if callable(metrics_callback):
@@ -1293,7 +1321,9 @@ def train_bpe(
             if not pair_counts:
                 break
 
+            pick_t0 = time.perf_counter()
             left, right = _pick_pair_to_merge(pair_counts)
+            pick_ms = 1000.0 * (time.perf_counter() - pick_t0)
             merged = left + right
             merges.append((left, right))
             vocab[next_id] = merged
@@ -1301,15 +1331,20 @@ def train_bpe(
 
             merge_t0 = time.perf_counter()
             merge_delta = _merge_pair_all_words_with_pair_deltas(words, left, right, merged)
+            merge_ms = 1000.0 * (time.perf_counter() - merge_t0)
+            apply_t0 = time.perf_counter()
             for p, d in merge_delta.items():
                 new_v = pair_counts.get(p, 0) + d
                 if new_v > 0:
                     pair_counts[p] = new_v
                 else:
                     pair_counts.pop(p, None)
-            merge_ms = 1000.0 * (time.perf_counter() - merge_t0)
-            if ckpt:
+            apply_ms = 1000.0 * (time.perf_counter() - apply_t0)
+            io_ms = 0.0
+            if ckpt and (iter_no % checkpoint_every_n_merges == 0 or len(vocab) >= vocab_size):
+                io_t0 = time.perf_counter()
                 _save_checkpoint(ckpt, vocab, merges)
+                io_ms = 1000.0 * (time.perf_counter() - io_t0)
             iter_wall_ms = 1000.0 * (time.perf_counter() - iter_t0)
             cumulative_iter_wall_ms += iter_wall_ms
             merge_iters_executed += 1
@@ -1318,8 +1353,9 @@ def train_bpe(
             _ser_log_interval = max(1, merges_target // 20)
             if iter_no == 1 or iter_no % _ser_log_interval == 0 or iter_no == merges_target:
                 _log.info(
-                    "[merge] %d/%d (%.0f%%) avg=%.1fms/iter [serial]",
+                    "[merge] %d/%d (%.0f%%) avg=%.1fms/iter [serial pick=%.1fms merge=%.1fms apply=%.1fms io=%.1fms]",
                     iter_no, merges_target, 100.0 * iter_no / max(merges_target, 1), avg_merge_wall_ms,
+                    pick_ms, merge_ms, apply_ms, io_ms,
                 )
 
             if callable(metrics_callback):

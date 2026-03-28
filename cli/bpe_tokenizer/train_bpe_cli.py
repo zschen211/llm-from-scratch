@@ -63,6 +63,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional checkpoint path written during training (same JSON format).",
     )
     parser.add_argument(
+        "--checkpoint-every-n-merges",
+        type=int,
+        default=50,
+        help="Checkpoint save interval in merge iterations (default: 1, save every merge).",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Enable cProfile profiling; saves .prof file to --profile-dir (default: .prof/).",
@@ -279,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         num_workers=args.num_workers,
         force_restart=bool(args.force_restart),
         checkpoint_path=args.checkpoint_path,
+        checkpoint_every_n_merges=args.checkpoint_every_n_merges,
         metrics_callback=metrics_callback,
         profile_dir=profile_dir,
         stream_chunk_chars=args.stream_chunk_chars,
