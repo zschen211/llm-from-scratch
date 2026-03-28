@@ -99,6 +99,19 @@ def main(argv: list[str] | None = None) -> int:
              "Set to 2 or higher for large files to reduce memory usage. "
              "Default is 1 to maintain backward compatibility.",
     )
+    parser.add_argument(
+        "--use-inverted-index",
+        action="store_true",
+        default=True,
+        help="Enable inverted index optimization for merge operations (default: enabled). "
+             "Significantly speeds up merge by only processing words containing the target pair.",
+    )
+    parser.add_argument(
+        "--no-inverted-index",
+        action="store_false",
+        dest="use_inverted_index",
+        help="Disable inverted index optimization (for debugging or comparison).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -291,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         stream_chunk_chars=args.stream_chunk_chars,
         stream_memory_target_percent=args.stream_memory_target_percent,
         min_pair_freq=args.min_pair_freq,
+        use_inverted_index=args.use_inverted_index,
     )
 
     _save_checkpoint(Path(args.out), vocab=vocab, merges=merges)

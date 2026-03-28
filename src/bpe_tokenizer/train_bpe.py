@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import multiprocessing as _mp
 import os
 import pickle
 import shutil
+import signal
+import sys
 import tempfile
 import time
 from collections import Counter
@@ -733,6 +736,17 @@ def _load_words_chunk(path: Path) -> list[list[bytes]]:
     return data
 
 
+def _dump_words_chunk_with_index(path: Path, chunk: Any) -> None:
+    """保存带索引的 chunk（使用 WordsChunkWithIndex.save）。"""
+    chunk.save(path)
+
+
+def _load_words_chunk_with_index(path: Path) -> Any:
+    """加载带索引的 chunk（使用 WordsChunkWithIndex.load）。"""
+    from ._merge_optimizer import WordsChunkWithIndex
+    return WordsChunkWithIndex.load(path)
+
+
 def _get_system_memory_percent() -> float | None:
     """返回系统内存占用百分比；不可用时返回 None。
 
@@ -781,16 +795,18 @@ def _load_chunk_batch(
     chunk_files: list[Path],
     start_idx: int,
     memory_target_percent: float,
-) -> tuple[list[tuple[Path, list[list[bytes]]]], int]:
+    use_inverted_index: bool = False,
+) -> tuple[list[tuple[Path, Any]], int]:
     """
     从 *start_idx* 开始顺序加载 chunk 文件到内存，
     直到系统内存占用率 >= *memory_target_percent* 或所有 chunk 都已加载。
     至少加载一个 chunk 以保证进度。
 
     返回 (loaded_list, next_start_idx)。
-    loaded_list 保持文件原始顺序: [(path, words), ...]。
+    loaded_list 保持文件原始顺序: [(path, chunk), ...]。
+    chunk 可能是 list[list[bytes]] 或 WordsChunkWithIndex，取决于 use_inverted_index。
     """
-    loaded: list[tuple[Path, list[list[bytes]]]] = []
+    loaded: list[tuple[Path, Any]] = []
     idx = start_idx
 
     # 为后续操作（如_count_pairs）预留内存空间，使用更保守的阈值
@@ -803,8 +819,13 @@ def _load_chunk_batch(
             if mem is not None and mem >= conservative_threshold:
                 break
         path = chunk_files[idx]
-        words = _load_words_chunk(path)
-        loaded.append((path, words))
+
+        if use_inverted_index:
+            chunk = _load_words_chunk_with_index(path)
+        else:
+            chunk = _load_words_chunk(path)
+
+        loaded.append((path, chunk))
         idx += 1
 
         # 加载后立即检查内存，避免超载
@@ -836,6 +857,9 @@ def train_bpe(
             metrics_callback(metrics: dict[str, Any])。
         profile_dir: 可选；若提供目录路径，使用 cProfile 对训练全程采样并将
             .prof 文件写入该目录（文件名含时间戳与 PID）。
+            若用户按 Ctrl-C（SIGINT）中断，仍会尽量落盘（文件名可带 `_interrupted` 后缀）；
+            进程正常退出时还会通过 atexit 再兜底一次（幂等，不会重复写入）。
+            Ctrl-D 仅在从标准输入读数据的场景有意义；本函数只读 `input_path` 文件，一般不因 Ctrl-D 触发。
         stream_chunk_chars: 流式读取时每次从文件中读取的字符数（默认 1_000_000）。
             > 0 时启用流式读取；设为 0 禁用流式，回退到一次性 read_text 模式。
         stream_memory_target_percent: 外存模式内存占用率阈值（默认 85）。
@@ -863,6 +887,54 @@ def train_bpe(
     force_restart = bool(kwargs.get("force_restart", False))
 
     metrics_callback: Callable[[dict[str, Any]], None] | None = kwargs.get("metrics_callback")
+
+    # cProfile：正常结束、Ctrl-C（SIGINT）、进程退出（atexit）时尽量落盘；幂等只写一次。
+    _profile_saved = False
+    _sigint_previous: Any = None
+
+    def _flush_training_profile(*, interrupted: bool | None = None) -> None:
+        nonlocal _profile_saved, _sigint_previous
+        if not profile_dir or _profiler is None or _profile_saved:
+            return
+        if interrupted is None:
+            interrupted = sys.exc_info()[0] is not None
+        _profile_saved = True
+        try:
+            _profiler.disable()
+        except (ValueError, RuntimeError):
+            pass
+        try:
+            _prof_dir = Path(profile_dir)
+            _prof_dir.mkdir(parents=True, exist_ok=True)
+            suffix = "_interrupted" if interrupted else ""
+            _prof_file = _prof_dir / f"train_bpe_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}{suffix}.prof"
+            _profiler.dump_stats(str(_prof_file))
+            if interrupted:
+                _log.info("[profile] saved to %s (interrupt or pending exception)", _prof_file)
+            else:
+                _log.info("[profile] saved to %s", _prof_file)
+            if callable(metrics_callback):
+                metrics_callback(
+                    {"event": "profile_saved", "path": str(_prof_file), "interrupted": bool(interrupted)}
+                )
+        except Exception as exc:
+            _log.warning("[profile] save failed: %s", exc)
+        finally:
+            if _sigint_previous is not None:
+                try:
+                    signal.signal(signal.SIGINT, _sigint_previous)
+                except (OSError, ValueError):
+                    pass
+                _sigint_previous = None
+
+    if profile_dir:
+
+        def _sigint_handler(signum: int, frame: Any) -> None:
+            _flush_training_profile(interrupted=True)
+            raise KeyboardInterrupt from None
+
+        _sigint_previous = signal.signal(signal.SIGINT, _sigint_handler)
+        atexit.register(lambda: _flush_training_profile(interrupted=None))
     stream_chunk_chars = int(kwargs.get("stream_chunk_chars", 1_000_000) or 1_000_000)
 
     file_size_mb = input_path.stat().st_size / (1024 * 1024)
@@ -925,15 +997,29 @@ def train_bpe(
 
             with open(input_path, "r", encoding="utf-8") as f:
                 carry = ""
+                use_inverted_index = bool(kwargs.get("use_inverted_index", True))
+
                 while True:
                     if accumulated_words:
                         mem = _get_system_memory_percent()
                         if mem is not None and mem >= pretok_dump_threshold:
                             chunk_index += 1
                             cpath = chunks_dir / f"chunk_{chunk_index:06d}.pkl"
-                            _dump_words_chunk(cpath, accumulated_words)
+
+                            if use_inverted_index:
+                                from ._merge_optimizer import WordsChunkWithIndex
+                                chunk_with_index = WordsChunkWithIndex(accumulated_words)
+                                index_t0 = time.perf_counter()
+                                chunk_with_index.build_index()
+                                index_ms = 1000.0 * (time.perf_counter() - index_t0)
+                                _log.info("[pretokenize] memory %.0f%% >= threshold, spilled chunk_%06d (words=%d, index_ms=%.1f, pairs=%d)",
+                                          mem, chunk_index, len(accumulated_words), index_ms, len(chunk_with_index.pair_index))
+                                _dump_words_chunk_with_index(cpath, chunk_with_index)
+                            else:
+                                _dump_words_chunk(cpath, accumulated_words)
+                                _log.info("[pretokenize] memory %.0f%% >= threshold, spilled chunk_%06d to disk (words=%d)", mem, chunk_index, len(accumulated_words))
+
                             chunk_files.append(cpath)
-                            _log.info("[pretokenize] memory %.0f%% >= threshold, spilled chunk_%06d to disk (words=%d)", mem, chunk_index, len(accumulated_words))
                             accumulated_words = []
                             _force_release_memory()
 
@@ -984,7 +1070,21 @@ def train_bpe(
             if accumulated_words:
                 chunk_index += 1
                 cpath = chunks_dir / f"chunk_{chunk_index:06d}.pkl"
-                _dump_words_chunk(cpath, accumulated_words)
+
+                # 使用倒排索引优化（如果启用）
+                use_inverted_index = bool(kwargs.get("use_inverted_index", True))
+                if use_inverted_index:
+                    from ._merge_optimizer import WordsChunkWithIndex
+                    chunk_with_index = WordsChunkWithIndex(accumulated_words)
+                    _log.info("[pretokenize] building inverted index for chunk_%06d (words=%d)", chunk_index, len(accumulated_words))
+                    index_t0 = time.perf_counter()
+                    chunk_with_index.build_index()
+                    index_ms = 1000.0 * (time.perf_counter() - index_t0)
+                    _log.info("[pretokenize] index built in %.1fms, pairs=%d", index_ms, len(chunk_with_index.pair_index))
+                    _dump_words_chunk_with_index(cpath, chunk_with_index)
+                else:
+                    _dump_words_chunk(cpath, accumulated_words)
+
                 chunk_files.append(cpath)
                 accumulated_words = []
 
@@ -1014,6 +1114,9 @@ def train_bpe(
 
             _log.info("[merge] starting BPE merge iterations (target=%d merges)", merges_target)
 
+            use_inverted_index = bool(kwargs.get("use_inverted_index", True))
+            _log.info("[merge] inverted index: %s", "enabled" if use_inverted_index else "disabled")
+
             # 初始pair统计阶段：使用低频过滤减少内存占用
             # 对于大文件，初始状态下可能有数千万个唯一pair，其中大部分只出现1-2次
             # 通过过滤低频pair，可以显著减少内存占用（通常可减少50-70%）
@@ -1023,45 +1126,84 @@ def train_bpe(
                 _log.info("[merge] initial pair counting with min_freq=%d to reduce memory usage", min_pair_freq)
 
             first_batch, first_next = _load_chunk_batch(
-                chunk_files, 0, memory_target_percent,
+                chunk_files, 0, memory_target_percent, use_inverted_index=use_inverted_index,
             )
             all_in_memory = first_next >= len(chunk_files)
             _log.info("[merge] chunk loading: all_in_memory=%s (%d/%d chunks loaded)", all_in_memory, first_next, len(chunk_files))
 
             pair_counts: Counter[tuple[bytes, bytes]] = Counter()
 
-            if all_in_memory:
-                # 快速路径：全部 chunk 驻留内存，merge 期间零磁盘 I/O。
-                resident_chunks: list[list[list[bytes]]] = [w for _, w in first_batch]
-                del first_batch
-                for words_chunk in resident_chunks:
-                    pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
-            else:
-                # 慢速路径：先用首批统计，再继续分批加载剩余 chunk。
-                for _cpath, words_chunk in first_batch:
-                    pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
-                del first_batch
-                _force_release_memory()
-                batch_start = first_next
-                while batch_start < len(chunk_files):
-                    batch, batch_start = _load_chunk_batch(
-                        chunk_files, batch_start, memory_target_percent,
-                    )
-                    for _cpath, words_chunk in batch:
-                        pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
-                    del batch
-                    _force_release_memory()
+            if use_inverted_index:
+                # 使用倒排索引加速统计
+                from ._merge_optimizer import count_pairs_with_index
 
-                # 统计完成后，再次过滤低频pair以释放内存
-                # 因为分批统计时，某些pair在单个batch中可能>=min_freq，但全局频率仍然很低
-                if min_pair_freq > 1:
-                    before_count = len(pair_counts)
-                    pair_counts = Counter({p: cnt for p, cnt in pair_counts.items() if cnt >= min_pair_freq})
-                    after_count = len(pair_counts)
-                    if before_count > after_count:
-                        _log.info("[merge] filtered low-freq pairs: %d -> %d (removed %d pairs)",
-                                  before_count, after_count, before_count - after_count)
+                if all_in_memory:
+                    resident_chunks_with_index: list[Any] = [chunk for _, chunk in first_batch]
+                    del first_batch
+                    for chunk in resident_chunks_with_index:
+                        chunk_pair_counts = count_pairs_with_index(chunk)
+                        if min_pair_freq > 1:
+                            chunk_pair_counts = {p: c for p, c in chunk_pair_counts.items() if c >= min_pair_freq}
+                        pair_counts.update(chunk_pair_counts)
+                else:
+                    for _cpath, chunk in first_batch:
+                        chunk_pair_counts = count_pairs_with_index(chunk)
+                        if min_pair_freq > 1:
+                            chunk_pair_counts = {p: c for p, c in chunk_pair_counts.items() if c >= min_pair_freq}
+                        pair_counts.update(chunk_pair_counts)
+                    del first_batch
+                    _force_release_memory()
+                    batch_start = first_next
+                    while batch_start < len(chunk_files):
+                        batch, batch_start = _load_chunk_batch(
+                            chunk_files, batch_start, memory_target_percent, use_inverted_index=True,
+                        )
+                        for _cpath, chunk in batch:
+                            chunk_pair_counts = count_pairs_with_index(chunk)
+                            if min_pair_freq > 1:
+                                chunk_pair_counts = {p: c for p, c in chunk_pair_counts.items() if c >= min_pair_freq}
+                            pair_counts.update(chunk_pair_counts)
+                        del batch
                         _force_release_memory()
+
+                    if min_pair_freq > 1:
+                        before_count = len(pair_counts)
+                        pair_counts = Counter({p: cnt for p, cnt in pair_counts.items() if cnt >= min_pair_freq})
+                        after_count = len(pair_counts)
+                        if before_count > after_count:
+                            _log.info("[merge] filtered low-freq pairs: %d -> %d (removed %d pairs)",
+                                      before_count, after_count, before_count - after_count)
+                            _force_release_memory()
+            else:
+                # 原有逻辑：不使用倒排索引
+                if all_in_memory:
+                    resident_chunks: list[list[list[bytes]]] = [w for _, w in first_batch]
+                    del first_batch
+                    for words_chunk in resident_chunks:
+                        pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
+                else:
+                    for _cpath, words_chunk in first_batch:
+                        pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
+                    del first_batch
+                    _force_release_memory()
+                    batch_start = first_next
+                    while batch_start < len(chunk_files):
+                        batch, batch_start = _load_chunk_batch(
+                            chunk_files, batch_start, memory_target_percent, use_inverted_index=False,
+                        )
+                        for _cpath, words_chunk in batch:
+                            pair_counts.update(_count_pairs(words_chunk, min_freq=min_pair_freq))
+                        del batch
+                        _force_release_memory()
+
+                    if min_pair_freq > 1:
+                        before_count = len(pair_counts)
+                        pair_counts = Counter({p: cnt for p, cnt in pair_counts.items() if cnt >= min_pair_freq})
+                        after_count = len(pair_counts)
+                        if before_count > after_count:
+                            _log.info("[merge] filtered low-freq pairs: %d -> %d (removed %d pairs)",
+                                      before_count, after_count, before_count - after_count)
+                            _force_release_memory()
 
             while len(vocab) < vocab_size:
                 iter_no = len(merges) + 1
@@ -1082,32 +1224,59 @@ def train_bpe(
                 iter_delta: dict[tuple[bytes, bytes], int] = {}
                 merge_t0 = time.perf_counter()
 
-                if all_in_memory:
-                    for words_chunk in resident_chunks:
-                        delta = _merge_pair_all_words_with_pair_deltas(
-                            words_chunk, left, right, merged,
-                        )
-                        for p, d in delta.items():
-                            iter_delta[p] = iter_delta.get(p, 0) + d
+                if use_inverted_index:
+                    # 使用倒排索引加速 merge
+                    if all_in_memory:
+                        for chunk in resident_chunks_with_index:
+                            delta = chunk.merge_pair_with_deltas(left, right, merged)
+                            for p, d in delta.items():
+                                iter_delta[p] = iter_delta.get(p, 0) + d
+                    else:
+                        batch_start = 0
+                        while batch_start < len(chunk_files):
+                            io_t0 = time.perf_counter()
+                            batch, batch_start = _load_chunk_batch(
+                                chunk_files, batch_start, memory_target_percent, use_inverted_index=True,
+                            )
+                            io_ms += 1000.0 * (time.perf_counter() - io_t0)
+                            for cpath, chunk in batch:
+                                delta = chunk.merge_pair_with_deltas(left, right, merged)
+                                for p, d in delta.items():
+                                    iter_delta[p] = iter_delta.get(p, 0) + d
+                                io_t0 = time.perf_counter()
+                                _dump_words_chunk_with_index(cpath, chunk)
+                                io_ms += 1000.0 * (time.perf_counter() - io_t0)
+                            del batch
+                            _force_release_memory()
                 else:
-                    batch_start = 0
-                    while batch_start < len(chunk_files):
-                        io_t0 = time.perf_counter()
-                        batch, batch_start = _load_chunk_batch(
-                            chunk_files, batch_start, memory_target_percent,
-                        )
-                        io_ms += 1000.0 * (time.perf_counter() - io_t0)
-                        for cpath, words_chunk in batch:
+                    # 原有逻辑：不使用倒排索引
+                    if all_in_memory:
+                        for words_chunk in resident_chunks:
                             delta = _merge_pair_all_words_with_pair_deltas(
                                 words_chunk, left, right, merged,
                             )
                             for p, d in delta.items():
                                 iter_delta[p] = iter_delta.get(p, 0) + d
+                    else:
+                        batch_start = 0
+                        while batch_start < len(chunk_files):
                             io_t0 = time.perf_counter()
-                            _dump_words_chunk(cpath, words_chunk)
+                            batch, batch_start = _load_chunk_batch(
+                                chunk_files, batch_start, memory_target_percent, use_inverted_index=False,
+                            )
                             io_ms += 1000.0 * (time.perf_counter() - io_t0)
-                        del batch
-                        _force_release_memory()
+                            for cpath, words_chunk in batch:
+                                delta = _merge_pair_all_words_with_pair_deltas(
+                                    words_chunk, left, right, merged,
+                                )
+                                for p, d in delta.items():
+                                    iter_delta[p] = iter_delta.get(p, 0) + d
+                                io_t0 = time.perf_counter()
+                                _dump_words_chunk(cpath, words_chunk)
+                                io_ms += 1000.0 * (time.perf_counter() - io_t0)
+                            del batch
+                            _force_release_memory()
+
                 merge_ms = 1000.0 * (time.perf_counter() - merge_t0)
 
                 apply_t0 = time.perf_counter()
@@ -1168,14 +1337,7 @@ def train_bpe(
                     }
                 )
 
-            if _profiler is not None:
-                _profiler.disable()
-                _prof_dir = Path(profile_dir)  # type: ignore[arg-type]
-                _prof_dir.mkdir(parents=True, exist_ok=True)
-                _prof_file = _prof_dir / f"train_bpe_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.prof"
-                _profiler.dump_stats(str(_prof_file))
-                if callable(metrics_callback):
-                    metrics_callback({"event": "profile_saved", "path": str(_prof_file)})
+            _flush_training_profile(interrupted=False)
 
             _log.info("train_bpe done: vocab_size=%d, merges=%d", len(vocab), len(merges))
             return vocab, merges
@@ -1404,14 +1566,6 @@ def train_bpe(
         len(vocab), len(merges), cumulative_iter_wall_ms / 1000.0,
     )
 
-    if _profiler is not None:
-        _profiler.disable()
-        _prof_dir = Path(profile_dir)  # type: ignore[arg-type]
-        _prof_dir.mkdir(parents=True, exist_ok=True)
-        _prof_file = _prof_dir / f"train_bpe_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.prof"
-        _profiler.dump_stats(str(_prof_file))
-        _log.info("[profile] saved to %s", _prof_file)
-        if callable(metrics_callback):
-            metrics_callback({"event": "profile_saved", "path": str(_prof_file)})
+    _flush_training_profile(interrupted=False)
 
     return vocab, merges
