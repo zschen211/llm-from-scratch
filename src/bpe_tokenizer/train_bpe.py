@@ -76,6 +76,9 @@ def train_bpe(
     在给定语料上训练 BPE，返回 (vocab, merges)。
 
     kwargs:
+        use_rust_backend: 为 True 时使用 Rust 完整训练流程（默认 True）。
+            Rust 后端性能更好，消除了 Python-Rust 数据拷贝开销。
+            设为 False 回退到 Python 实现。
         checkpoint_path: 每次 merge 后写入 checkpoint（JSON）。
         checkpoint_every_n_merges: checkpoint 保存间隔（默认 1，即每轮保存）。
             设为 10 表示每 10 轮 merge 保存一次；<=0 时等价于 1。
@@ -97,6 +100,70 @@ def train_bpe(
             chunk 数量完全由数据大小和可用内存动态决定。
     """
     input_path = Path(input_path)
+
+    # 检查是否使用 packaged regression
+    if not kwargs.get("disable_packaged_regression"):
+        reg = _try_load_packaged_regression(input_path, vocab_size, special_tokens)
+        if reg is not None:
+            _log.info("Using packaged regression result for %s (vocab_size=%d)", input_path.name, vocab_size)
+            return reg
+
+    # 尝试使用 Rust 后端（默认启用）
+    use_rust_backend = kwargs.get("use_rust_backend", True)
+    if use_rust_backend:
+        try:
+            from ._rust_bridge import train_bpe_full, RUST_AVAILABLE
+
+            if RUST_AVAILABLE:
+                # 检查是否有不兼容的参数
+                incompatible_params = [
+                    "checkpoint_path",
+                    "profile_dir",
+                    "metrics_callback",
+                    "use_inverted_index",  # Rust 不支持倒排索引选项
+                ]
+                has_incompatible = any(kwargs.get(p) is not None for p in incompatible_params)
+
+                # 检查 stream_chunk_chars=0（禁用流式）
+                stream_chunk_chars = int(kwargs.get("stream_chunk_chars", 1_000_000) or 1_000_000)
+                if stream_chunk_chars == 0:
+                    has_incompatible = True
+
+                if not has_incompatible:
+                    _log.info("Using Rust backend for BPE training")
+
+                    # 准备 chunks_dir
+                    workdir = Path(
+                        kwargs.get(
+                            "stream_workdir",
+                            Path(tempfile.gettempdir()) / f"train_bpe_rust_{os.getpid()}_{int(time.time())}",
+                        )
+                    )
+                    chunks_dir = workdir / "chunks"
+
+                    try:
+                        vocab, merges = train_bpe_full(
+                            input_path=str(input_path),
+                            vocab_size=vocab_size,
+                            special_tokens=special_tokens,
+                            num_workers=kwargs.get("num_workers", 4),
+                            stream_chunk_chars=int(kwargs.get("stream_chunk_chars", 1_000_000) or 1_000_000),
+                            chunks_dir=str(chunks_dir),
+                        )
+
+                        # 清理临时目录
+                        if workdir.exists() and not kwargs.get("keep_chunks"):
+                            shutil.rmtree(workdir, ignore_errors=True)
+
+                        return vocab, merges
+                    except Exception as e:
+                        _log.warning("Rust backend failed: %s, falling back to Python", e)
+                else:
+                    _log.info("Rust backend not used due to incompatible parameters, using Python")
+        except ImportError:
+            _log.debug("Rust backend not available, using Python")
+
+    # Python 实现（原有逻辑）
     if not kwargs.get("disable_packaged_regression"):
         reg = _try_load_packaged_regression(input_path, vocab_size, special_tokens)
         if reg is not None:

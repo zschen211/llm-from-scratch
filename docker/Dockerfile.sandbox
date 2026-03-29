@@ -1,4 +1,35 @@
 # 使用国内可用的 Docker Hub 镜像代理（Daocloud），避免直连 docker.io
+#
+# 多阶段构建：
+# - bpe-core-builder：在容器内用 maturin 编译 PyO3 扩展 bpe_core（Release）
+# - 最终镜像：pip 安装 wheel，运行时 `import bpe_core` 可用（_rust_bridge 走 Rust）
+
+FROM docker.m.daocloud.io/library/python:3.12-slim AS bpe-core-builder
+
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /workspace
+
+COPY libs/bpe_core /workspace/libs/bpe_core
+
+RUN pip install --no-cache-dir -U pip maturin \
+    && cd /workspace/libs/bpe_core \
+    && maturin build --release \
+    && WHEEL=$(ls target/wheels/bpe_core-*.whl 2>/dev/null | head -n1) \
+    && test -n "$WHEEL" \
+    && cp "$WHEEL" /tmp/bpe_core.whl
+
+# ---------------------------------------------------------------------------
 FROM docker.m.daocloud.io/library/python:3.12-slim
 
 WORKDIR /workspace
@@ -43,6 +74,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -c "import tomllib; from pathlib import Path; data=tomllib.loads(Path('/workspace/pyproject.toml').read_text(encoding='utf-8')); deps=data.get('project', {}).get('dependencies', []); Path('/tmp/requirements-thirdparty.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" && \
     pip install -r /tmp/requirements-thirdparty.txt
 
+# 安装 Rust 扩展 bpe_core（与宿主机 llm-from-scratch 可选安装一致，供 _rust_bridge 使用）
+COPY --from=bpe-core-builder /tmp/bpe_core.whl /tmp/bpe_core.whl
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir /tmp/bpe_core.whl && rm -f /tmp/bpe_core.whl
+
 # 再复制项目代码（data/ 会通过 .dockerignore 排除，并在运行时以 volume 方式挂载）
 COPY src /workspace/src
 COPY cli /workspace/cli
@@ -56,4 +92,3 @@ ENV PYTHONPATH=/workspace/src
 
 # 默认入口：sandbox runner 的容器侧执行器
 ENTRYPOINT ["python", "-m", "llm_from_scratch.sandbox.sandbox_runner_entrypoint"]
-

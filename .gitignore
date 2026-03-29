@@ -12,4 +12,4 @@ __pycache__/
 venv/
 .prof/
 llm_from_scratch.egg-info/
-
+benchmarks/

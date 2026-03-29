@@ -1,26 +1,47 @@
-use regex::Regex;
+use fancy_regex::Regex;
 use std::sync::OnceLock;
 
-/// GPT-2 的预分词正则表达式
-static ENCODE_SPLIT_PATTERN: OnceLock<Regex> = OnceLock::new();
+/// GPT-2 的预分词正则表达式（tiktoken 对齐）
+static TIKTOKEN_GPT2_PATTERN: OnceLock<Regex> = OnceLock::new();
 
-fn get_pattern() -> &'static Regex {
-    ENCODE_SPLIT_PATTERN.get_or_init(|| {
+/// CS336 课程的预分词正则表达式
+static CS336_PATTERN: OnceLock<Regex> = OnceLock::new();
+
+fn get_tiktoken_pattern() -> &'static Regex {
+    TIKTOKEN_GPT2_PATTERN.get_or_init(|| {
         Regex::new(
-            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-        ).unwrap()
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"
+        ).expect("Failed to compile tiktoken GPT-2 pattern")
     })
 }
 
-/// 预处理和预分词
-pub fn preprocess_and_pretokenize(
+fn get_cs336_pattern() -> &'static Regex {
+    CS336_PATTERN.get_or_init(|| {
+        Regex::new(
+            r"'(?:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
+        ).expect("Failed to compile CS336 pattern")
+    })
+}
+
+/// 预处理和预分词（使用 fancy-regex 支持环视断言）
+pub fn pretokenize_with_pat(
     text: &str,
     special_tokens: &[String],
+    use_tiktoken_pat: bool,
 ) -> Vec<Vec<Vec<u8>>> {
     let mut words = Vec::new();
+    let special_set: std::collections::HashSet<String> =
+        special_tokens.iter().cloned().collect();
 
     // 按 special tokens 切分
     let segments = split_by_special_tokens(text, special_tokens);
+
+    // 选择 PAT 模式
+    let pattern = if use_tiktoken_pat {
+        get_tiktoken_pattern()
+    } else {
+        get_cs336_pattern()
+    };
 
     for (kind, segment) in segments {
         if kind == "special" {
@@ -28,30 +49,45 @@ pub fn preprocess_and_pretokenize(
             words.push(vec![segment.as_bytes().to_vec()]);
         } else {
             // 普通文本：使用 PAT 正则分词
-            let pattern = get_pattern();
             for mat in pattern.find_iter(&segment) {
-                let frag = mat.as_str();
-                if frag.is_empty() {
-                    continue;
-                }
+                match mat {
+                    Ok(m) => {
+                        let frag = m.as_str();
+                        if frag.is_empty() {
+                            continue;
+                        }
 
-                // 检查是否是 special token
-                if special_tokens.contains(&frag.to_string()) {
-                    words.push(vec![frag.as_bytes().to_vec()]);
-                } else {
-                    // 拆分为字节
-                    let bytes: Vec<Vec<u8>> = frag
-                        .as_bytes()
-                        .iter()
-                        .map(|&b| vec![b])
-                        .collect();
-                    words.push(bytes);
+                        // 检查是否是 special token
+                        if special_set.contains(frag) {
+                            words.push(vec![frag.as_bytes().to_vec()]);
+                        } else {
+                            // 将 fragment 拆分为字节级别的 tokens
+                            let byte_tokens: Vec<Vec<u8>> = frag
+                                .as_bytes()
+                                .iter()
+                                .map(|&b| vec![b])
+                                .collect();
+                            words.push(byte_tokens);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Regex error: {}", e);
+                        break;
+                    }
                 }
             }
         }
     }
 
     words
+}
+
+/// 预处理和预分词（保留旧接口，使用 tiktoken PAT）
+pub fn preprocess_and_pretokenize(
+    text: &str,
+    special_tokens: &[String],
+) -> Vec<Vec<Vec<u8>>> {
+    pretokenize_with_pat(text, special_tokens, true)
 }
 
 /// 按 special tokens 切分文本

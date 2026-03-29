@@ -1,12 +1,9 @@
 """
-sandbox_runner_cli：在 docker 沙盒内执行项目子命令并采集监控数据。
+sandbox_runner_cli：在 docker 沙盒内执行项目子命令。
 
 主要能力：
 - 以用户给定的 CPU/内存限制运行 docker 容器
 - 把宿主机 `data/` 以只读方式挂载到容器（`/workspace/data`）
-- 容器内启动一个简易 Prometheus 指标采集器：
-  - 指标 HTTP：`http://<host>:<metrics-host-port>/metrics`
-  - 指标落盘：`--output-root/<run-id>/metrics/metrics.prom`
 - 记录命令日志：`--output-root/<run-id>/logs/command.log`
 - profiling 落盘：如果子命令支持 `--prof/--profile` 等选项，输出会写入挂载目录
 """
@@ -47,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
         "--output-root",
         type=str,
         default=None,
-        help="Root directory for sandbox outputs (metrics/logs/prof). Default: <project_root>/runs",
+        help="Root directory for sandbox outputs (logs/prof). Default: <project_root>/runs",
     )
     parser.add_argument(
         "--data-dir",
@@ -68,21 +65,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Docker image tag used for sandbox runner.",
     )
     parser.add_argument(
-        "--metrics-host-port",
-        type=int,
-        default=19090,
-        help="Expose container metrics HTTP port to this host port.",
-    )
-    parser.add_argument(
-        "--metrics-interval-s",
-        type=float,
-        default=1.0,
-        help="Metrics sampling interval in seconds (container side).",
-    )
-    parser.add_argument(
         "--skip-build",
         action="store_true",
         help="Skip docker build step (assumes image already exists).",
+    )
+    parser.add_argument(
+        "--no-install-perf",
+        action="store_true",
+        help="Skip linux-perf installation in docker image (faster build).",
     )
     parser.add_argument(
         "--dry-run",
@@ -144,10 +134,9 @@ def main(argv: list[str] | None = None) -> int:
         dockerfile=dockerfile,
         image_tag=args.image_tag,
         data_dir=data_dir,
-        metrics_host_port=args.metrics_host_port,
         dry_run=bool(args.dry_run),
         build_image=not bool(args.skip_build),
-        metrics_interval_s=args.metrics_interval_s,
+        install_perf=not bool(args.no_install_perf),
         docker_cap_add=tuple(cap_list),
     )
 
@@ -158,14 +147,12 @@ def main(argv: list[str] | None = None) -> int:
     cli_log.info("sandbox_runner_cli start: run_id=%s cpu=%s memory=%s", run_id, cfg.cpu, cfg.memory)
     cli_log.info("cmd: %s", " ".join(cmd))
     cli_log.info("output: %s", output_root / run_id)
-    cli_log.info("metrics: http://localhost:%d/metrics", args.metrics_host_port)
     cli_log.info("src logs -> %s", src_log_path)
 
     result = run_sandbox(cfg, log=_log)
 
     cli_log.info("exit_code: %s", result.exit_code)
     cli_log.info("logs: %s", result.logs_dir / "command.log")
-    cli_log.info("metrics: %s", result.metrics_dir / "metrics.prom")
 
     return int(result.exit_code or 0)
 

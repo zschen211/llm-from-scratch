@@ -1,26 +1,44 @@
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
-/// 统计 words 中所有相邻字节对的频率
+/// 统计 words 中所有相邻字节对的频率（使用 Rayon 并行）
 pub fn count_pairs(
     words: &[Vec<Vec<u8>>],
     min_freq: usize,
 ) -> HashMap<(Vec<u8>, Vec<u8>), usize> {
-    let mut counts: FxHashMap<(Vec<u8>, Vec<u8>), usize> = FxHashMap::default();
-
-    for word in words {
-        for i in 0..word.len().saturating_sub(1) {
-            let pair = (word[i].clone(), word[i + 1].clone());
-            *counts.entry(pair).or_insert(0) += 1;
-        }
-    }
+    // 使用 Rayon 并行处理每个 word，然后合并结果
+    let counts: FxHashMap<(Vec<u8>, Vec<u8>), usize> = words
+        .par_iter()
+        .fold(
+            || FxHashMap::default(),
+            |mut acc, word| {
+                for i in 0..word.len().saturating_sub(1) {
+                    let pair = (word[i].clone(), word[i + 1].clone());
+                    *acc.entry(pair).or_insert(0) += 1;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || FxHashMap::default(),
+            |mut acc, map| {
+                for (pair, count) in map {
+                    *acc.entry(pair).or_insert(0) += count;
+                }
+                acc
+            },
+        );
 
     // 过滤低频 pair
     if min_freq > 1 {
-        counts.retain(|_, &mut count| count >= min_freq);
+        counts
+            .into_iter()
+            .filter(|(_, count)| *count >= min_freq)
+            .collect()
+    } else {
+        counts.into_iter().collect()
     }
-
-    counts.into_iter().collect()
 }
 
 #[cfg(test)]

@@ -31,25 +31,18 @@ class SandboxRunConfig:
     image_tag: str
 
     data_dir: Path
-    metrics_host_port: int
 
     dry_run: bool = False
     build_image: bool = True
-    metrics_interval_s: float = 1.0
 
     # 传给 `docker run` 的额外能力。默认包含 PERFMON，便于容器内 `perf trace` 使用 perf_event_open。
     # 若需最小权限，在 CLI 传 --no-sandbox-perf-caps，或在此处显式传入 docker_cap_add=()。
     docker_cap_add: tuple[str, ...] = ("PERFMON",)
 
-    # “你可以使用 Prometheus + Grafana”的前提是指标采用 Prometheus exposition format。
-    # 这里容器内指标服务端口固定，host 通过 -p 映射到 metrics_host_port。
-    container_metrics_port: int = 8000
-
 
 @dataclasses.dataclass(frozen=True)
 class SandboxRunResult:
     run_dir: Path
-    metrics_dir: Path
     logs_dir: Path
     prof_dir: Path
     docker_build_cmd: list[str]
@@ -67,21 +60,19 @@ def _quote_cmd(cmd: list[str]) -> str:
     return " ".join(shlex.quote(x) for x in cmd)
 
 
-def prepare_run_dirs(cfg: SandboxRunConfig) -> tuple[Path, Path, Path, Path]:
+def prepare_run_dirs(cfg: SandboxRunConfig) -> tuple[Path, Path, Path]:
     run_dir = cfg.output_root / cfg.run_id
-    metrics_dir = run_dir / "metrics"
     logs_dir = run_dir / "logs"
     prof_dir = run_dir / "prof"
 
-    _maybe_makedirs(metrics_dir)
     _maybe_makedirs(logs_dir)
     _maybe_makedirs(prof_dir)
 
-    # 确保“日志/指标落盘目录”在 dry-run 情况下也能落地，便于脚本联动。
+    # 确保日志落盘目录在 dry-run 情况下也能落地，便于脚本联动。
     (logs_dir / "command.log").touch(exist_ok=True)
-    (metrics_dir / "metrics.prom").touch(exist_ok=True)
+    (logs_dir / "src.log").touch(exist_ok=True)
 
-    return run_dir, metrics_dir, logs_dir, prof_dir
+    return run_dir, logs_dir, prof_dir
 
 
 def assemble_docker_build_cmd(cfg: SandboxRunConfig) -> list[str]:
@@ -105,9 +96,6 @@ def assemble_docker_run_cmd(cfg: SandboxRunConfig, run_dir: Path) -> list[str]:
     container_data_dir = "/workspace/data"
     container_prof_dir = "/workspace/.prof"
 
-    # 容器内 metrics 文本落盘位置（collector 会写这个文件）
-    container_metrics_path = f"{container_out_dir}/metrics/metrics.prom"
-
     container_name = f"llm-sandbox-{cfg.run_id}"
 
     docker_cmd: list[str] = [
@@ -129,8 +117,6 @@ def assemble_docker_run_cmd(cfg: SandboxRunConfig, run_dir: Path) -> list[str]:
             "-v", "/sys/kernel/tracing:/sys/kernel/tracing:ro",
         ])
     docker_cmd += [
-        "-p",
-        f"{cfg.metrics_host_port}:{cfg.container_metrics_port}",
         "-v",
         f"{str(cfg.data_dir)}:{container_data_dir}:ro",
         "-v",
@@ -142,22 +128,14 @@ def assemble_docker_run_cmd(cfg: SandboxRunConfig, run_dir: Path) -> list[str]:
         "-e",
         f"SANDBOX_OUT_DIR={container_out_dir}",
         "-e",
-        f"SANDBOX_METRICS_PATH={container_metrics_path}",
-        "-e",
-        f"SANDBOX_METRICS_INTERVAL_S={str(cfg.metrics_interval_s)}",
-        "-e",
         f"SANDBOX_CPU_LIMIT={str(cfg.cpu)}",
+        "-e",
+        f"SANDBOX_SRC_LOG_PATH={container_out_dir}/logs/src.log",
     ]
     docker_cmd += [
         cfg.image_tag,
         "--out-dir",
         container_out_dir,
-        "--metrics-port",
-        str(cfg.container_metrics_port),
-        "--metrics-path",
-        container_metrics_path,
-        "--metrics-interval-s",
-        str(cfg.metrics_interval_s),
         "--",
         *cfg.cmd,
     ]
@@ -198,7 +176,7 @@ def run_sandbox(
 ) -> SandboxRunResult:
     _log = log or (lambda s: (sys.stderr.write(s), sys.stderr.flush()))
 
-    run_dir, metrics_dir, logs_dir, prof_dir = prepare_run_dirs(cfg)
+    run_dir, logs_dir, prof_dir = prepare_run_dirs(cfg)
 
     docker_build_cmd = assemble_docker_build_cmd(cfg)
     docker_run_cmd = assemble_docker_run_cmd(cfg, run_dir)
@@ -210,7 +188,6 @@ def run_sandbox(
         )
         return SandboxRunResult(
             run_dir=run_dir,
-            metrics_dir=metrics_dir,
             logs_dir=logs_dir,
             prof_dir=prof_dir,
             docker_build_cmd=docker_build_cmd,
@@ -238,7 +215,6 @@ def run_sandbox(
 
     return SandboxRunResult(
         run_dir=run_dir,
-        metrics_dir=metrics_dir,
         logs_dir=logs_dir,
         prof_dir=prof_dir,
         docker_build_cmd=docker_build_cmd,

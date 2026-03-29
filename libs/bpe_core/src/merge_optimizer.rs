@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 
@@ -237,58 +238,72 @@ fn merge_word(
     (out, did_merge)
 }
 
-/// merge_pair_all_words_with_deltas 的纯 Rust 实现（不使用倒排索引）
+/// merge_pair_all_words_with_deltas 的纯 Rust 实现（使用 Rayon 并行）
 pub fn merge_pair_all_words_with_deltas(
     words: &mut [Vec<Vec<u8>>],
     left: &[u8],
     right: &[u8],
     merged: &[u8],
 ) -> HashMap<(Vec<u8>, Vec<u8>), i32> {
-    let mut delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
+    // 使用 Rayon 并行处理每个 word
+    let results: Vec<(Vec<Vec<u8>>, FxHashMap<(Vec<u8>, Vec<u8>), i32>)> = words
+        .par_iter()
+        .map(|word| {
+            if word.len() < 2 {
+                return (word.clone(), FxHashMap::default());
+            }
 
-    for word in words.iter_mut() {
-        if word.len() < 2 {
-            continue;
-        }
+            let (new_word, did_merge) = merge_word(word, left, right, merged);
 
-        let (new_word, did_merge) = merge_word(word, left, right, merged);
+            if !did_merge {
+                return (word.clone(), FxHashMap::default());
+            }
 
-        if !did_merge {
-            continue;
-        }
+            let mut delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
 
-        // 计算 delta（简化版本）
-        for i in 0..word.len() - 1 {
-            if i + 1 < word.len() && word[i] == left && word[i + 1] == right {
-                if i > 0 {
-                    let pair = (word[i - 1].clone(), word[i].clone());
-                    *delta.entry(pair).or_insert(0) -= 1;
-                }
-                *delta.entry((left.to_vec(), right.to_vec())).or_insert(0) -= 1;
-                if i + 2 < word.len() {
-                    let pair = (word[i + 1].clone(), word[i + 2].clone());
-                    *delta.entry(pair).or_insert(0) -= 1;
+            // 计算被移除的 pairs
+            for i in 0..word.len() - 1 {
+                if i + 1 < word.len() && word[i] == left && word[i + 1] == right {
+                    if i > 0 {
+                        let pair = (word[i - 1].clone(), word[i].clone());
+                        *delta.entry(pair).or_insert(0) -= 1;
+                    }
+                    *delta.entry((left.to_vec(), right.to_vec())).or_insert(0) -= 1;
+                    if i + 2 < word.len() {
+                        let pair = (word[i + 1].clone(), word[i + 2].clone());
+                        *delta.entry(pair).or_insert(0) -= 1;
+                    }
                 }
             }
-        }
 
-        for i in 0..new_word.len() - 1 {
-            if new_word[i] == merged {
-                if i > 0 {
-                    let pair = (new_word[i - 1].clone(), new_word[i].clone());
-                    *delta.entry(pair).or_insert(0) += 1;
-                }
-                if i + 1 < new_word.len() {
-                    let pair = (new_word[i].clone(), new_word[i + 1].clone());
-                    *delta.entry(pair).or_insert(0) += 1;
+            // 计算新增的 pairs
+            for i in 0..new_word.len() - 1 {
+                if new_word[i] == merged {
+                    if i > 0 {
+                        let pair = (new_word[i - 1].clone(), new_word[i].clone());
+                        *delta.entry(pair).or_insert(0) += 1;
+                    }
+                    if i + 1 < new_word.len() {
+                        let pair = (new_word[i].clone(), new_word[i + 1].clone());
+                        *delta.entry(pair).or_insert(0) += 1;
+                    }
                 }
             }
-        }
 
-        *word = new_word;
+            (new_word, delta)
+        })
+        .collect();
+
+    // 合并所有 delta 并更新 words
+    let mut total_delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
+    for (i, (new_word, delta)) in results.into_iter().enumerate() {
+        words[i] = new_word;
+        for (pair, count) in delta {
+            *total_delta.entry(pair).or_insert(0) += count;
+        }
     }
 
-    delta.into_iter().filter(|(_, v)| *v != 0).collect()
+    total_delta.into_iter().filter(|(_, v)| *v != 0).collect()
 }
 
 #[cfg(test)]

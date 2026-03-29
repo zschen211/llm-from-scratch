@@ -55,6 +55,7 @@ def _preprocess_and_pretokenize_training_text(
     special_tokens: list[str],
     metrics_callback: Callable[[dict[str, Any]], None] | None = None,
     num_workers: int | None = None,
+    use_rust: bool = True,
 ) -> list[list[bytes]]:
     """
     把预处理与预分词拆成两个阶段，便于输出可观测性指标：
@@ -64,7 +65,41 @@ def _preprocess_and_pretokenize_training_text(
     预分词必须与 tiktoken/GPT-2 的 PAT 一致；当前 bpe_core 使用 Rust `regex` 库，
     无法编译含环视的 PAT（如 `(?!\\S)`），故此处始终使用本文件的 Python 实现。
     流式落盘时的倒排 chunk 仍通过 `_rust_bridge.WordsChunkWithIndex` 使用 Rust（若已安装 bpe_core）。
+
+    Args:
+        text: 输入文本
+        special_tokens: 特殊 token 列表
+        metrics_callback: 性能指标回调函数
+        num_workers: 并行 worker 数量
+        use_rust: 是否使用 Rust 实现（默认 True）
     """
+    # 尝试使用 Rust 实现
+    if use_rust:
+        try:
+            from ._rust_bridge import RUST_PAT_AVAILABLE, pretokenize_with_pat
+
+            if RUST_PAT_AVAILABLE:
+                if callable(metrics_callback):
+                    metrics_callback({"event": "stage_start", "stage": "data_pretokenization"})
+
+                pretoken_t0 = time.perf_counter()
+                words = pretokenize_with_pat(text, special_tokens, use_tiktoken_pat=True)
+                pretok_ms = 1000.0 * (time.perf_counter() - pretoken_t0)
+
+                if callable(metrics_callback):
+                    metrics_callback(
+                        {
+                            "event": "stage_end",
+                            "stage": "data_pretokenization",
+                            "metrics": {"pretok_count": len(words), "pretok_ms": pretok_ms},
+                        }
+                    )
+
+                return words
+        except Exception as e:
+            _log.warning(f"Rust PAT 分词失败，回退到 Python 实现: {e}")
+
+    # Python 实现（原有逻辑）
     specials = sorted(special_tokens, key=len, reverse=True)
     special_set = set(special_tokens)
     n = len(text)

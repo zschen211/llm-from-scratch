@@ -26,8 +26,6 @@ def test_sandbox_runner_cli_dry_run_writes_run_dir(run_cli, tmp_path: Path) -> N
             run_id,
             "--output-root",
             str(tmp_path),
-            "--metrics-host-port",
-            "19123",
             "--skip-build",
             "--",
             "python",
@@ -36,14 +34,15 @@ def test_sandbox_runner_cli_dry_run_writes_run_dir(run_cli, tmp_path: Path) -> N
         ],
     )
     assert proc.returncode == 0, proc.stderr
-    assert f"run_id: {run_id}" in proc.stdout
+    assert run_id in proc.stdout
 
     run_dir = tmp_path / run_id
     assert run_dir.is_dir()
     assert (run_dir / "docker_commands.txt").is_file()
     assert (run_dir / "logs" / "command.log").is_file()
-    assert (run_dir / "metrics" / "metrics.prom").is_file()
+    assert (run_dir / "logs" / "src.log").is_file()
 
-    assert "docker_run_cmd:" in proc.stdout
-    assert "docker_build_cmd:" in proc.stdout
+    docker_txt = (run_dir / "docker_commands.txt").read_text(encoding="utf-8")
+    assert "DOCKER_RUN:" in docker_txt
+    assert "DOCKER_BUILD:" in docker_txt
 

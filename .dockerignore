@@ -19,3 +19,6 @@ tokenizer/
 # git 相关
 .git/
 
+# Rust 构建产物（由 Dockerfile 在构建阶段重新编译）
+libs/bpe_core/target/
+

@@ -1,0 +1,14 @@
+/Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/deps/pyo3_build_config-bd33e8859a1d4056.d: /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/lib.rs /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/errors.rs /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/impl_.rs /Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config-file.txt /Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config.txt
+
+/Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/deps/libpyo3_build_config-bd33e8859a1d4056.rlib: /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/lib.rs /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/errors.rs /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/impl_.rs /Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config-file.txt /Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config.txt
+
+/Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/deps/libpyo3_build_config-bd33e8859a1d4056.rmeta: /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/lib.rs /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/errors.rs /Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/impl_.rs /Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config-file.txt /Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config.txt
+
+/Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/lib.rs:
+/Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/errors.rs:
+/Users/cheesepapa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.22.6/src/impl_.rs:
+/Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config-file.txt:
+/Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out/pyo3-build-config.txt:
+
+# env-dep:CARGO_PKG_VERSION=0.22.6
+# env-dep:OUT_DIR=/Users/cheesepapa/Projects/llm-from-scratch/libs/bpe_core/target/debug/build/pyo3-build-config-3d37deb33d286c72/out

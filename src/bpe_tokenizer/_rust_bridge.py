@@ -27,17 +27,27 @@ try:
     from bpe_core import (
         WordsChunkWithIndex as RustWordsChunkWithIndex,
         count_pairs_py as rust_count_pairs,
+        dump_words_chunk_py as rust_dump_words_chunk,
+        load_words_chunk_py as rust_load_words_chunk,
         merge_pair_all_words_with_deltas_py as rust_merge_pair_all_words_with_deltas,
         preprocess_and_pretokenize_py as rust_preprocess_and_pretokenize,
+        pretokenize_with_pat_py as rust_pretokenize_with_pat,
+        train_bpe_full_py as rust_train_bpe_full,
     )
 
     RUST_AVAILABLE = True
+    RUST_PAT_AVAILABLE = True
 except ImportError as e:
     RUST_AVAILABLE = False
+    RUST_PAT_AVAILABLE = False
     RustWordsChunkWithIndex = None
     rust_count_pairs = None
+    rust_dump_words_chunk = None
+    rust_load_words_chunk = None
     rust_merge_pair_all_words_with_deltas = None
     rust_preprocess_and_pretokenize = None
+    rust_pretokenize_with_pat = None
+    rust_train_bpe_full = None
     _log.debug("bpe_core 导入失败，将使用 Python 回退: %s", e)
 
 # 如果 Rust 不可用，回退到 Python 实现
@@ -99,6 +109,33 @@ def preprocess_and_pretokenize(
         return rust_preprocess_and_pretokenize(text, special_tokens)
     else:
         # Python 实现需要额外参数，这里简化调用
+        return python_preprocess_and_pretokenize(
+            text, special_tokens, metrics_callback=None, num_workers=1
+        )
+
+
+def pretokenize_with_pat(
+    text: str,
+    special_tokens: list[str],
+    use_tiktoken_pat: bool = True,
+) -> list[list[bytes]]:
+    """使用 fancy-regex 的预分词（支持环视断言）。
+
+    优先使用 Rust 实现，如果不可用则回退到 Python 实现。
+
+    Args:
+        text: 输入文本
+        special_tokens: 特殊 token 列表
+        use_tiktoken_pat: 是否使用 tiktoken GPT-2 PAT（默认 True），否则使用 CS336 PAT
+
+    Returns:
+        预分词后的 words 列表
+    """
+    _log_backend_once("pretokenize_with_pat", rust=RUST_PAT_AVAILABLE)
+    if RUST_PAT_AVAILABLE:
+        return rust_pretokenize_with_pat(text, special_tokens, use_tiktoken_pat)
+    else:
+        # 回退到 Python 实现
         return python_preprocess_and_pretokenize(
             text, special_tokens, metrics_callback=None, num_workers=1
         )
@@ -184,7 +221,79 @@ class WordsChunkWithIndex:
 __all__ = [
     "WordsChunkWithIndex",
     "count_pairs",
+    "dump_words_chunk",
+    "load_words_chunk",
     "merge_pair_all_words_with_deltas",
     "preprocess_and_pretokenize",
+    "pretokenize_with_pat",
+    "train_bpe_full",
     "RUST_AVAILABLE",
+    "RUST_PAT_AVAILABLE",
 ]
+
+
+def dump_words_chunk(path: str, words: list[list[bytes]]) -> None:
+    """保存 words chunk 到文件（bincode 格式）。
+
+    优先使用 Rust 实现，如果不可用则回退到 Python pickle。
+    """
+    _log_backend_once("dump_words_chunk", rust=RUST_AVAILABLE)
+    if RUST_AVAILABLE:
+        rust_dump_words_chunk(path, words)
+    else:
+        # 回退到 pickle
+        import pickle
+
+        with open(path, "wb") as f:
+            pickle.dump(words, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_words_chunk(path: str) -> list[list[bytes]]:
+    """从文件加载 words chunk（bincode 格式）。
+
+    优先使用 Rust 实现，如果不可用则回退到 Python pickle。
+    """
+    _log_backend_once("load_words_chunk", rust=RUST_AVAILABLE)
+    if RUST_AVAILABLE:
+        return rust_load_words_chunk(path)
+    else:
+        # 回退到 pickle
+        import pickle
+
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+
+def train_bpe_full(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str],
+    num_workers: int = 4,
+    stream_chunk_chars: int = 1_000_000,
+    chunks_dir: str = ".bpe_chunks",
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """完整的 BPE 训练流程（Rust 实现）。
+
+    Args:
+        input_path: 输入语料文件路径
+        vocab_size: 目标词表大小
+        special_tokens: 特殊 token 列表
+        num_workers: 并行 worker 数量
+        stream_chunk_chars: 流式读取的 chunk 大小（字符数）
+        chunks_dir: chunk 文件存储目录
+
+    Returns:
+        (vocab, merges) 元组
+    """
+    _log_backend_once("train_bpe_full", rust=RUST_AVAILABLE)
+    if RUST_AVAILABLE:
+        return rust_train_bpe_full(
+            input_path,
+            vocab_size,
+            special_tokens,
+            num_workers,
+            stream_chunk_chars,
+            chunks_dir,
+        )
+    else:
+        raise NotImplementedError("train_bpe_full 需要 Rust 实现，请安装 bpe_core")
