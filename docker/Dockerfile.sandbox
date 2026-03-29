@@ -1,92 +1,35 @@
 # 使用国内可用的 Docker Hub 镜像代理（Daocloud），避免直连 docker.io
 #
-# 多阶段构建：
-# - bpe-core-builder：在容器内用 maturin 编译 PyO3 扩展 bpe_core（Release）
-# - 最终镜像：pip 安装 wheel，运行时 `import bpe_core` 可用（_rust_bridge 走 Rust）
+# Rust 扩展 bpe_core 由 build.sh 在宿主机预编译为 wheel，构建时直接注入，
+# 容器内无需 Rust 工具链。运行时 `import bpe_core` 可用（_rust_bridge 走 Rust）。
 
-FROM docker.m.daocloud.io/library/python:3.12-slim AS bpe-core-builder
-
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-WORKDIR /workspace
-
-COPY libs/bpe_core /workspace/libs/bpe_core
-
-RUN pip install --no-cache-dir -U pip maturin \
-    && cd /workspace/libs/bpe_core \
-    && maturin build --release \
-    && WHEEL=$(ls target/wheels/bpe_core-*.whl 2>/dev/null | head -n1) \
-    && test -n "$WHEEL" \
-    && cp "$WHEEL" /tmp/bpe_core.whl
-
-# ---------------------------------------------------------------------------
 FROM docker.m.daocloud.io/library/python:3.12-slim
 
 WORKDIR /workspace
 
-# 使用项目一致的 PyPI 镜像源，避免容器内 DNS/直连 PyPI 不稳定导致 build 失败。
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-ENV PIP_CACHE_DIR=/root/.cache/pip
+# 三方依赖：由宿主机 ./docker/build.sh 阶段 0 预下载 wheel，构建时离线安装（容器内无需访问 PyPI）。
+# 若未先下载，docker build 会因缺少文件失败。
+COPY docker/requirements-thirdparty.txt /tmp/requirements-thirdparty.txt
+COPY docker/wheels/thirdparty /tmp/wheels
 
-# linux-perf 体积大、依赖多，首次 apt 安装会较慢；重建镜像时 BuildKit 会复用 apt 缓存层。
-# 不需要 perf 时：`docker build --build-arg INSTALL_PERF=0 ...` 可跳过该层以显著加快构建。
-ARG INSTALL_PERF=1
-# 可选：国内 Debian 镜像，加速 apt 下载（与 python:3.12-slim 的 bookworm 源对应）
-ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    set -eux; \
-    if [ "$INSTALL_PERF" = "1" ]; then \
-      if [ -n "$DEBIAN_MIRROR" ]; then \
-        SEC_MIRROR="${DEBIAN_MIRROR%/debian}/debian-security"; \
-        for f in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do \
-          if [ -f "$f" ]; then \
-            sed -i "s|http://deb.debian.org/debian|$DEBIAN_MIRROR|g" "$f"; \
-            sed -i "s|https://deb.debian.org/debian|$DEBIAN_MIRROR|g" "$f"; \
-            sed -i "s|http://security.debian.org/debian-security|$SEC_MIRROR|g" "$f"; \
-            sed -i "s|https://security.debian.org/debian-security|$SEC_MIRROR|g" "$f"; \
-          fi; \
-        done; \
-      fi; \
-      apt-get update; \
-      apt-get install -y --no-install-recommends linux-perf; \
-      rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# 先复制依赖元数据，构建稳定的“三方依赖层”缓存（源码变化不应触发重装）。
+# 先复制依赖元数据（与 uv.lock 对齐；wheel 目录已含解析后的版本）。
 COPY pyproject.toml uv.lock /workspace/
 
-# 安装构建工具 + 三方依赖（仅来自 pyproject 的 project.dependencies）
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U pip setuptools wheel && \
-    python -c "import tomllib; from pathlib import Path; data=tomllib.loads(Path('/workspace/pyproject.toml').read_text(encoding='utf-8')); deps=data.get('project', {}).get('dependencies', []); Path('/tmp/requirements-thirdparty.txt').write_text('\\n'.join(deps) + '\\n', encoding='utf-8')" && \
-    pip install -r /tmp/requirements-thirdparty.txt
+# 勿使用 pip install -U pip（会访问 PyPI）；基础镜像已含 pip，仅 --no-index + find-links
+RUN pip install --no-index --find-links=/tmp/wheels -r /tmp/requirements-thirdparty.txt
 
-# 安装 Rust 扩展 bpe_core（与宿主机 llm-from-scratch 可选安装一致，供 _rust_bridge 使用）
-COPY --from=bpe-core-builder /tmp/bpe_core.whl /tmp/bpe_core.whl
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir /tmp/bpe_core.whl && rm -f /tmp/bpe_core.whl
+# 安装 Rust 扩展 bpe_core（wheel 须保留 PEP 427 文件名，勿用固定名 bpe_core.whl）
+COPY docker/wheels/bpe_core-*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/bpe_core-*.whl && rm -f /tmp/bpe_core-*.whl
 
 # 再复制项目代码（data/ 会通过 .dockerignore 排除，并在运行时以 volume 方式挂载）
 COPY src /workspace/src
 COPY cli /workspace/cli
 COPY main.py /workspace/
 
-# 安装本地项目本身，不重复安装三方依赖
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-deps -e .
+# 离线可编辑安装：隔离构建会拉 PyPI，故先装 setuptools/wheel 再 --no-build-isolation
+RUN pip install --no-index --find-links=/tmp/wheels setuptools wheel && \
+    pip install --no-deps --no-build-isolation --no-index --find-links=/tmp/wheels -e .
 
 ENV PYTHONPATH=/workspace/src
 

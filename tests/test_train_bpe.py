@@ -1,6 +1,8 @@
 import json
 import time
 
+import pytest
+
 from .adapters import run_train_bpe
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
 
@@ -67,14 +69,14 @@ def test_train_bpe_special_tokens(snapshot):
     Ensure that the special tokens are added to the vocabulary and not
     merged with other tokens.
     """
+    pytest.importorskip("bpe_core", reason="train_bpe 现为 Rust-only，需 maturin develop 安装 bpe_core")
+
     input_path = FIXTURES_PATH / "tinystories_sample_5M.txt"
-    # 快照在「全内存 + 无倒排索引」路径下录制；流式 + 内存阈值可能导致 chunk 边界随机器负载变化。
+    # 快照由 bpe_core（Rust）训练结果录制；算法或实现变更时需重新生成 pkl。
     vocab, merges = run_train_bpe(
         input_path=input_path,
         vocab_size=1000,
         special_tokens=["<|endoftext|>"],
-        stream_chunk_chars=0,
-        use_inverted_index=False,
     )
 
     # Check that the special token is not in the vocab

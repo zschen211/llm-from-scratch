@@ -1,11 +1,43 @@
 use crate::io::WordsChunk;
 use crate::pair_counter::count_pairs;
 use crate::pretokenizer::pretokenize_with_pat;
+use log::info;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// 与 Python `llm_from_scratch` 子 logger 对齐，以便 CLI 配置的 file handler 能收到 Rust 侧日志。
+const LOG_PRETOKENIZE: &str = "llm_from_scratch.bpe_core.pretokenize";
+const LOG_MERGE: &str = "llm_from_scratch.bpe_core.merge";
+const LOG_TRAINER: &str = "llm_from_scratch.bpe_core.trainer";
+
+fn mib_u64(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn format_eta_secs(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "?".to_string();
+    }
+    if seconds < 90.0 {
+        format!("{:.0}s", seconds)
+    } else if seconds < 3600.0 {
+        format!("{:.1}min", seconds / 60.0)
+    } else {
+        format!("{:.1}h", seconds / 3600.0)
+    }
+}
+
+/// 所有 chunk 文件在磁盘上的总字节数（merge 阶段每步会读+写一遍，用于 MiB/s 吞吐）。
+fn sum_chunk_disk_bytes(paths: &[PathBuf]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum()
+}
 
 /// BPE 训练器
 pub struct BPETrainer {
@@ -47,8 +79,21 @@ impl BPETrainer {
         let mut chunk_files = Vec::new();
         let mut chunk_index = 0;
         let mut accumulated_words = Vec::new();
-        let mut buffer = String::new();
+        // 按字节读入；非法 UTF-8 用 U+FFFD 替换（对齐常见「文本语料含少量坏字节」场景，避免 `read_to_string` 整段报错）。
+        let mut raw_chunk: Vec<u8> = Vec::new();
         let mut carry = String::new();
+        let mut read_cycles: u64 = 0;
+        let mut total_bytes_from_file: u64 = 0;
+        let pretokenize_t0 = Instant::now();
+        let mut last_progress_log = pretokenize_t0;
+
+        info!(
+            target: LOG_PRETOKENIZE,
+            "streaming pretokenize start path={} stream_chunk_bytes={} spill_words_threshold=100000 file_size_bytes={}",
+            input_path.display(),
+            self.stream_chunk_chars,
+            file_size
+        );
 
         // 找到最长的 special token 用于对齐
         let split_special = self
@@ -59,20 +104,26 @@ impl BPETrainer {
             .unwrap_or_else(|| "<|endoftext|>".to_string());
 
         loop {
-            buffer.clear();
+            raw_chunk.clear();
             let bytes_read = reader
                 .by_ref()
                 .take(self.stream_chunk_chars as u64)
-                .read_to_string(&mut buffer)?;
+                .read_to_end(&mut raw_chunk)?;
 
             if bytes_read == 0 && carry.is_empty() {
                 break;
             }
 
-            let mut text = if !carry.is_empty() {
-                carry.clone() + &buffer
+            read_cycles += 1;
+            total_bytes_from_file = total_bytes_from_file.saturating_add(bytes_read as u64);
+
+            let decoded = String::from_utf8_lossy(&raw_chunk);
+            let mut text = if carry.is_empty() {
+                decoded.into_owned()
             } else {
-                buffer.clone()
+                let mut t = std::mem::take(&mut carry);
+                t.push_str(&decoded);
+                t
             };
 
             // 在 special token 边界对齐
@@ -100,12 +151,52 @@ impl BPETrainer {
             let words_part = pretokenize_with_pat(&text, &self.special_tokens, true);
             accumulated_words.extend(words_part);
 
+            // 进度：首包、每 10 次读、EOF 尾块、或至少每 2s 一次（含 MiB/MiB、%、吞吐量）
+            let log_this_read = read_cycles == 1
+                || read_cycles % 10 == 0
+                || (bytes_read == 0 && !text.is_empty())
+                || last_progress_log.elapsed() >= Duration::from_secs(2);
+            if log_this_read {
+                last_progress_log = Instant::now();
+                let elapsed = pretokenize_t0.elapsed().as_secs_f64().max(1e-9);
+                let mib_read = mib_u64(total_bytes_from_file);
+                let mib_s = mib_read / elapsed;
+                let (pct_part, total_part) = if file_size > 0 {
+                    let pct = 100.0 * (total_bytes_from_file as f64) / (file_size as f64);
+                    (
+                        format!(" ({:.1}%)", pct),
+                        format!("{:.2}MiB/{:.2}MiB", mib_read, mib_u64(file_size)),
+                    )
+                } else {
+                    (String::new(), format!("{:.2}MiB (total size unknown)", mib_read))
+                };
+                info!(
+                    target: LOG_PRETOKENIZE,
+                    "pretokenize progress: {}{} throughput={:.2}MiB/s read_cycles={} words_in_memory={} +{}B this_read",
+                    total_part,
+                    pct_part,
+                    mib_s,
+                    read_cycles,
+                    accumulated_words.len(),
+                    bytes_read,
+                );
+            }
+
             // 检查是否需要落盘（简化版：每 100K words 落盘一次）
             if accumulated_words.len() >= 100_000 {
                 chunk_index += 1;
                 let chunk_path = self.chunks_dir.join(format!("chunk_{:06}.bin", chunk_index));
+                let n_words = accumulated_words.len();
                 let chunk = WordsChunk::new(accumulated_words.clone());
                 chunk.save(&chunk_path)?;
+                info!(
+                    target: LOG_PRETOKENIZE,
+                    "spilled chunk {:06} -> {} (words={}, total_chunks={})",
+                    chunk_index,
+                    chunk_path.display(),
+                    n_words,
+                    chunk_files.len() + 1,
+                );
                 chunk_files.push(chunk_path);
                 accumulated_words.clear();
             }
@@ -115,10 +206,30 @@ impl BPETrainer {
         if !accumulated_words.is_empty() {
             chunk_index += 1;
             let chunk_path = self.chunks_dir.join(format!("chunk_{:06}.bin", chunk_index));
+            let n_words = accumulated_words.len();
             let chunk = WordsChunk::new(accumulated_words);
             chunk.save(&chunk_path)?;
+            info!(
+                target: LOG_PRETOKENIZE,
+                "spilled final chunk {:06} -> {} (words={}, total_chunks={})",
+                chunk_index,
+                chunk_path.display(),
+                n_words,
+                chunk_files.len() + 1,
+            );
             chunk_files.push(chunk_path);
         }
+
+        let wall = pretokenize_t0.elapsed().as_secs_f64().max(1e-9);
+        info!(
+            target: LOG_PRETOKENIZE,
+            "pretokenize done chunks={} read_cycles={} total_bytes={} wall={:.1}s avg_throughput={:.2}MiB/s",
+            chunk_files.len(),
+            read_cycles,
+            total_bytes_from_file,
+            wall,
+            mib_u64(total_bytes_from_file) / wall,
+        );
 
         Ok(chunk_files)
     }
@@ -227,9 +338,22 @@ impl BPETrainer {
     ) -> Result<(HashMap<usize, Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>), Box<dyn std::error::Error>>
     {
         // 1. 流式预分词
-        println!("开始流式预分词...");
+        info!(
+            target: LOG_TRAINER,
+            "train start input={} vocab_size={} num_workers={}",
+            input_path.display(),
+            self.vocab_size,
+            self.num_workers
+        );
         let chunk_files = self.streaming_pretokenize(input_path)?;
-        println!("预分词完成，生成 {} 个 chunk 文件", chunk_files.len());
+        let total_chunk_bytes = sum_chunk_disk_bytes(&chunk_files);
+        info!(
+            target: LOG_TRAINER,
+            "pretokenize finished chunk_files={} total_chunk_on_disk={:.2}MiB ({} bytes)",
+            chunk_files.len(),
+            mib_u64(total_chunk_bytes),
+            total_chunk_bytes
+        );
 
         // 2. 构建初始 vocab
         let mut vocab = self.build_initial_vocab();
@@ -238,18 +362,42 @@ impl BPETrainer {
         let initial_vocab_size = vocab.len();
         let num_merges = self.vocab_size.saturating_sub(initial_vocab_size);
 
-        println!("初始 vocab 大小: {}", initial_vocab_size);
-        println!("需要执行 {} 次 merge", num_merges);
+        info!(
+            target: LOG_TRAINER,
+            "initial_vocab_size={} planned_merges={}",
+            initial_vocab_size,
+            num_merges
+        );
 
         // 3. 初始统计
-        println!("统计初始 pair 频率...");
+        info!(
+            target: LOG_MERGE,
+            "counting initial pair frequencies ({} chunks, parallel)...",
+            chunk_files.len()
+        );
+        let count_t0 = Instant::now();
         let mut pair_counts = self.count_pairs_from_chunks(&chunk_files)?;
-        println!("初始 pair 数量: {}", pair_counts.len());
+        let count_wall = count_t0.elapsed().as_secs_f64().max(1e-9);
+        let count_chunk_mib_s = mib_u64(total_chunk_bytes) / count_wall;
+        info!(
+            target: LOG_MERGE,
+            "initial pair table size={} (count_pairs wall {:.1}s chunk_throughput={:.2}MiB/s over {} chunks)",
+            pair_counts.len(),
+            count_wall,
+            count_chunk_mib_s,
+            chunk_files.len()
+        );
 
         // 4. 迭代 merge
+        let merge_loop_t0 = Instant::now();
+        let mut last_merge_log = merge_loop_t0;
         for merge_idx in 0..num_merges {
             if pair_counts.is_empty() {
-                println!("没有更多 pair 可以合并，提前结束");
+                info!(
+                    target: LOG_MERGE,
+                    "no pairs left; stopping early at merge step {}",
+                    merge_idx
+                );
                 break;
             }
 
@@ -267,18 +415,12 @@ impl BPETrainer {
             vocab.insert(new_token_id, merged.clone());
             merges.push((left.clone(), right.clone()));
 
-            if merge_idx % 100 == 0 {
-                println!(
-                    "Merge {}/{}: freq={}, pair_len={}",
-                    merge_idx + 1,
-                    num_merges,
-                    freq,
-                    pair_counts.len()
-                );
-            }
+            let step = merge_idx + 1;
 
-            // 执行 merge 并获取增量
+            let merge_step_t0 = Instant::now();
             let delta = self.merge_pair_in_chunks(&chunk_files, &left, &right, &merged)?;
+            let step_merge_wall = merge_step_t0.elapsed().as_secs_f64().max(1e-9);
+            let chunk_throughput_mib_s = mib_u64(total_chunk_bytes) / step_merge_wall;
 
             // 更新 pair_counts
             pair_counts.remove(&(left, right));
@@ -289,9 +431,51 @@ impl BPETrainer {
                     pair_counts.remove(&pair);
                 }
             }
+
+            let elapsed = merge_loop_t0.elapsed().as_secs_f64().max(1e-9);
+            let mps = step as f64 / elapsed;
+            let pct = 100.0 * (step as f64) / (num_merges as f64).max(1.0);
+            let remaining = num_merges.saturating_sub(step);
+            let eta_s = if mps > 0.0 {
+                remaining as f64 / mps
+            } else {
+                f64::NAN
+            };
+
+            let log_step = step == 1
+                || step == num_merges
+                || step % 100 == 0
+                || num_merges <= 20
+                || last_merge_log.elapsed() >= Duration::from_secs(2);
+            if log_step {
+                last_merge_log = Instant::now();
+                let step_merge_rate = 1.0 / step_merge_wall;
+                info!(
+                    target: LOG_MERGE,
+                    "merge progress: {}/{} ({:.1}%) {:.2} merges/s(cum) ETA≈{} step_wall={:.3}s step_merge_rate={:.2}/s chunk_throughput={:.2}MiB/s ({} chunks, {:.2}MiB on disk) freq={} distinct_pairs={} new_token_id={}",
+                    step,
+                    num_merges,
+                    pct,
+                    mps,
+                    format_eta_secs(eta_s),
+                    step_merge_wall,
+                    step_merge_rate,
+                    chunk_throughput_mib_s,
+                    chunk_files.len(),
+                    mib_u64(total_chunk_bytes),
+                    freq,
+                    pair_counts.len(),
+                    new_token_id
+                );
+            }
         }
 
-        println!("训练完成！最终 vocab 大小: {}", vocab.len());
+        info!(
+            target: LOG_TRAINER,
+            "train done final_vocab_size={} merges_applied={}",
+            vocab.len(),
+            merges.len()
+        );
 
         Ok((vocab, merges))
     }

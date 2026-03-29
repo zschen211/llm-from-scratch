@@ -13,3 +13,7 @@ venv/
 .prof/
 llm_from_scratch.egg-info/
 benchmarks/
+
+# Docker 离线构建：宿主机下载的 wheel 与导出清单（体积大，不提交）
+docker/wheels/thirdparty/*.whl
+docker/requirements-thirdparty.txt

@@ -4,17 +4,13 @@ from __future__ import annotations
 
 import time
 
-# 测试 Rust 模块是否可用
-try:
-    from llm_from_scratch.bpe_tokenizer._rust_bridge import RUST_AVAILABLE
+import pytest
 
-    if RUST_AVAILABLE:
-        print("✓ Rust module is available")
-    else:
-        print("✗ Rust module is NOT available (using Python fallback)")
-except ImportError as e:
-    print(f"✗ Failed to import Rust bridge: {e}")
-    RUST_AVAILABLE = False
+pytest.importorskip("bpe_core")
+
+from llm_from_scratch.bpe_tokenizer._rust_bridge import RUST_AVAILABLE
+
+assert RUST_AVAILABLE is True
 
 
 def test_count_pairs():
@@ -128,9 +124,6 @@ def benchmark_merge_pair():
 
 if __name__ == "__main__":
     print("=== Testing Rust BPE Core Module ===\n")
-
-    if not RUST_AVAILABLE:
-        print("Rust module not available, tests will use Python fallback\n")
 
     try:
         test_count_pairs()

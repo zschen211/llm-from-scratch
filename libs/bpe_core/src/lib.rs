@@ -16,6 +16,9 @@ use trainer::BPETrainer;
 /// BPE 核心模块的 Python 绑定
 #[pymodule]
 fn bpe_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // 将 `log` crate 输出桥接到 Python `logging`（需在解释器中已配置好 handler，见 CLI）。
+    let _ = pyo3_log::try_init();
+
     m.add_class::<WordsChunkWithIndex>()?;
     m.add_function(wrap_pyfunction!(count_pairs_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_and_pretokenize_py, m)?)?;

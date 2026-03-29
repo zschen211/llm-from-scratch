@@ -70,11 +70,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip docker build step (assumes image already exists).",
     )
     parser.add_argument(
-        "--no-install-perf",
-        action="store_true",
-        help="Skip linux-perf installation in docker image (faster build).",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Do not call docker; just create run directory and write docker commands.",
@@ -136,7 +131,6 @@ def main(argv: list[str] | None = None) -> int:
         data_dir=data_dir,
         dry_run=bool(args.dry_run),
         build_image=not bool(args.skip_build),
-        install_perf=not bool(args.no_install_perf),
         docker_cap_add=tuple(cap_list),
     )
 
@@ -159,4 +153,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
