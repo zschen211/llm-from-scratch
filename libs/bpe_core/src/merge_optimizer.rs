@@ -4,6 +4,156 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 
+/// 为所有 word 构建 pair → 包含该 pair 的 word 下标集合（倒排索引）
+pub fn build_pair_index(words: &[Vec<Vec<u8>>]) -> FxHashMap<(Vec<u8>, Vec<u8>), FxHashSet<usize>> {
+    let mut pair_index: FxHashMap<(Vec<u8>, Vec<u8>), FxHashSet<usize>> = FxHashMap::default();
+    for (word_idx, word) in words.iter().enumerate() {
+        for i in 0..word.len().saturating_sub(1) {
+            let pair = (word[i].clone(), word[i + 1].clone());
+            pair_index
+                .entry(pair)
+                .or_insert_with(FxHashSet::default)
+                .insert(word_idx);
+        }
+    }
+    pair_index
+}
+
+/// 单条 word 上执行 merge 并返回与 `merge_pair_all_words_with_deltas` 一致的 delta（供并行与倒排索引路径共用）
+pub fn single_word_merge_delta(
+    word: &[Vec<u8>],
+    left: &[u8],
+    right: &[u8],
+    merged: &[u8],
+) -> (Vec<Vec<u8>>, FxHashMap<(Vec<u8>, Vec<u8>), i32>, bool) {
+    if word.len() < 2 {
+        return (word.to_vec(), FxHashMap::default(), false);
+    }
+
+    let (new_word, did_merge) = merge_word(word, left, right, merged);
+
+    if !did_merge {
+        return (word.to_vec(), FxHashMap::default(), false);
+    }
+
+    let mut delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
+
+    for i in 0..word.len() - 1 {
+        if i + 1 < word.len() && word[i] == left && word[i + 1] == right {
+            if i > 0 {
+                let pair = (word[i - 1].clone(), word[i].clone());
+                *delta.entry(pair).or_insert(0) -= 1;
+            }
+            *delta.entry((left.to_vec(), right.to_vec())).or_insert(0) -= 1;
+            if i + 2 < word.len() {
+                let pair = (word[i + 1].clone(), word[i + 2].clone());
+                *delta.entry(pair).or_insert(0) -= 1;
+            }
+        }
+    }
+
+    for i in 0..new_word.len() - 1 {
+        if new_word[i] == merged {
+            if i > 0 {
+                let pair = (new_word[i - 1].clone(), new_word[i].clone());
+                *delta.entry(pair).or_insert(0) += 1;
+            }
+            if i + 1 < new_word.len() {
+                let pair = (new_word[i].clone(), new_word[i + 1].clone());
+                *delta.entry(pair).or_insert(0) += 1;
+            }
+        }
+    }
+
+    (new_word, delta, true)
+}
+
+/// 使用全局倒排索引仅更新含目标 pair 的 word，并维护索引；返回与全量扫描 merge 一致的 delta
+pub fn merge_global_pair_with_index(
+    words: &mut Vec<Vec<Vec<u8>>>,
+    pair_index: &mut FxHashMap<(Vec<u8>, Vec<u8>), FxHashSet<usize>>,
+    left: &[u8],
+    right: &[u8],
+    merged: &[u8],
+) -> HashMap<(Vec<u8>, Vec<u8>), i32> {
+    let target_pair = (left.to_vec(), right.to_vec());
+
+    let affected_indices: Vec<usize> = match pair_index.get(&target_pair) {
+        Some(indices) => indices.iter().copied().collect(),
+        None => return HashMap::default(),
+    };
+
+    let mut total_delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
+    let mut pairs_to_remove: FxHashMap<(Vec<u8>, Vec<u8>), FxHashSet<usize>> = FxHashMap::default();
+    let mut pairs_to_add: FxHashMap<(Vec<u8>, Vec<u8>), FxHashSet<usize>> = FxHashMap::default();
+
+    for &word_idx in &affected_indices {
+        let word = &words[word_idx];
+        if word.len() < 2 {
+            continue;
+        }
+
+        let old_pairs: FxHashSet<(Vec<u8>, Vec<u8>)> = (0..word.len() - 1)
+            .map(|i| (word[i].clone(), word[i + 1].clone()))
+            .collect();
+
+        let (new_word, delta, did_merge) = single_word_merge_delta(word, left, right, merged);
+        if !did_merge {
+            if let Some(set) = pair_index.get_mut(&target_pair) {
+                set.remove(&word_idx);
+                if set.is_empty() {
+                    pair_index.remove(&target_pair);
+                }
+            }
+            continue;
+        }
+
+        for (pair, count) in delta {
+            *total_delta.entry(pair).or_insert(0) += count;
+        }
+
+        words[word_idx] = new_word.clone();
+
+        let new_pairs: FxHashSet<(Vec<u8>, Vec<u8>)> = (0..new_word.len().saturating_sub(1))
+            .map(|i| (new_word[i].clone(), new_word[i + 1].clone()))
+            .collect();
+
+        for pair in old_pairs.difference(&new_pairs) {
+            pairs_to_remove
+                .entry(pair.clone())
+                .or_insert_with(FxHashSet::default)
+                .insert(word_idx);
+        }
+
+        for pair in new_pairs.difference(&old_pairs) {
+            pairs_to_add
+                .entry(pair.clone())
+                .or_insert_with(FxHashSet::default)
+                .insert(word_idx);
+        }
+    }
+
+    for (pair, indices) in pairs_to_remove {
+        if let Some(index_set) = pair_index.get_mut(&pair) {
+            for idx in indices {
+                index_set.remove(&idx);
+            }
+            if index_set.is_empty() {
+                pair_index.remove(&pair);
+            }
+        }
+    }
+
+    for (pair, indices) in pairs_to_add {
+        pair_index
+            .entry(pair)
+            .or_insert_with(FxHashSet::default)
+            .extend(indices);
+    }
+
+    total_delta.into_iter().filter(|(_, v)| *v != 0).collect()
+}
+
 /// 带倒排索引的 words chunk（Rust 实现）
 #[pyclass]
 pub struct WordsChunkWithIndex {
@@ -245,56 +395,14 @@ pub fn merge_pair_all_words_with_deltas(
     right: &[u8],
     merged: &[u8],
 ) -> HashMap<(Vec<u8>, Vec<u8>), i32> {
-    // 使用 Rayon 并行处理每个 word
     let results: Vec<(Vec<Vec<u8>>, FxHashMap<(Vec<u8>, Vec<u8>), i32>)> = words
         .par_iter()
         .map(|word| {
-            if word.len() < 2 {
-                return (word.clone(), FxHashMap::default());
-            }
-
-            let (new_word, did_merge) = merge_word(word, left, right, merged);
-
-            if !did_merge {
-                return (word.clone(), FxHashMap::default());
-            }
-
-            let mut delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
-
-            // 计算被移除的 pairs
-            for i in 0..word.len() - 1 {
-                if i + 1 < word.len() && word[i] == left && word[i + 1] == right {
-                    if i > 0 {
-                        let pair = (word[i - 1].clone(), word[i].clone());
-                        *delta.entry(pair).or_insert(0) -= 1;
-                    }
-                    *delta.entry((left.to_vec(), right.to_vec())).or_insert(0) -= 1;
-                    if i + 2 < word.len() {
-                        let pair = (word[i + 1].clone(), word[i + 2].clone());
-                        *delta.entry(pair).or_insert(0) -= 1;
-                    }
-                }
-            }
-
-            // 计算新增的 pairs
-            for i in 0..new_word.len() - 1 {
-                if new_word[i] == merged {
-                    if i > 0 {
-                        let pair = (new_word[i - 1].clone(), new_word[i].clone());
-                        *delta.entry(pair).or_insert(0) += 1;
-                    }
-                    if i + 1 < new_word.len() {
-                        let pair = (new_word[i].clone(), new_word[i + 1].clone());
-                        *delta.entry(pair).or_insert(0) += 1;
-                    }
-                }
-            }
-
+            let (new_word, delta, _) = single_word_merge_delta(word, left, right, merged);
             (new_word, delta)
         })
         .collect();
 
-    // 合并所有 delta 并更新 words
     let mut total_delta: FxHashMap<(Vec<u8>, Vec<u8>), i32> = FxHashMap::default();
     for (i, (new_word, delta)) in results.into_iter().enumerate() {
         words[i] = new_word;
@@ -342,5 +450,61 @@ mod tests {
 
         assert!(!did_merge);
         assert_eq!(merged_word, word);
+    }
+
+    #[test]
+    fn test_merge_global_matches_parallel_scan() {
+        let words: Vec<Vec<Vec<u8>>> = vec![
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+            ],
+            vec![
+                b"x".to_vec(),
+                b"a".to_vec(),
+                b"a".to_vec(),
+                b"y".to_vec(),
+            ],
+            vec![b"m".to_vec(), b"n".to_vec()],
+        ];
+
+        let left = b"a".as_slice();
+        let right = b"a".as_slice();
+        let merged = b"aa".as_slice();
+
+        let mut parallel = words.clone();
+        let d_parallel = merge_pair_all_words_with_deltas(&mut parallel, left, right, merged);
+
+        let mut indexed = words.clone();
+        let mut idx = build_pair_index(&indexed);
+        let d_index = merge_global_pair_with_index(&mut indexed, &mut idx, left, right, merged);
+
+        assert_eq!(parallel, indexed);
+        assert_eq!(d_parallel, d_index);
+    }
+
+    #[test]
+    fn test_merge_global_matches_sequential_multi_step() {
+        let mut parallel = vec![
+            vec![b"h".to_vec(), b"e".to_vec(), b"l".to_vec(), b"l".to_vec()],
+            vec![b"l".to_vec(), b"l".to_vec(), b"o".to_vec()],
+        ];
+        let mut indexed = parallel.clone();
+        let mut idx = build_pair_index(&indexed);
+
+        let steps: &[(&[u8], &[u8], &[u8])] = &[
+            (b"l", b"l", b"ll"),
+            (b"h", b"e", b"he"),
+        ];
+
+        for &(l, r, m) in steps {
+            let mut p = parallel.clone();
+            let d1 = merge_pair_all_words_with_deltas(&mut p, l, r, m);
+            let d2 = merge_global_pair_with_index(&mut indexed, &mut idx, l, r, m);
+            parallel = p;
+            assert_eq!(parallel, indexed);
+            assert_eq!(d1, d2);
+        }
     }
 }

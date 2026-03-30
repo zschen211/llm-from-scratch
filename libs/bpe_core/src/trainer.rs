@@ -1,13 +1,114 @@
 use crate::io::WordsChunk;
+use crate::merge_optimizer::{build_pair_index, merge_global_pair_with_index};
 use crate::pair_counter::count_pairs;
 use crate::pretokenizer::pretokenize_with_pat;
 use log::info;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// 惰性大顶堆：存储 (频次, pair)，与 `pair_counts` 对照剔除过期项
+#[derive(Clone, Eq, PartialEq)]
+struct PairHeapEntry {
+    count: usize,
+    pair: (Vec<u8>, Vec<u8>),
+}
+
+impl Ord for PairHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.count
+            .cmp(&other.count)
+            .then_with(|| self.pair.cmp(&other.pair))
+    }
+}
+
+impl PartialOrd for PairHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn pair_heap_pop_best(
+    heap: &mut BinaryHeap<PairHeapEntry>,
+    pair_counts: &HashMap<(Vec<u8>, Vec<u8>), usize>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    while let Some(e) = heap.pop() {
+        if pair_counts.get(&e.pair) == Some(&e.count) && e.count > 0 {
+            return Some(e.pair);
+        }
+    }
+    for (pair, &count) in pair_counts {
+        if count > 0 {
+            heap.push(PairHeapEntry {
+                count,
+                pair: pair.clone(),
+            });
+        }
+    }
+    while let Some(e) = heap.pop() {
+        if pair_counts.get(&e.pair) == Some(&e.count) && e.count > 0 {
+            return Some(e.pair);
+        }
+    }
+    None
+}
+
+fn pair_heap_push_delta(
+    heap: &mut BinaryHeap<PairHeapEntry>,
+    delta: &HashMap<(Vec<u8>, Vec<u8>), i32>,
+    pair_counts: &HashMap<(Vec<u8>, Vec<u8>), usize>,
+) {
+    for pair in delta.keys() {
+        if let Some(&c) = pair_counts.get(pair) {
+            if c > 0 {
+                heap.push(PairHeapEntry {
+                    count: c,
+                    pair: pair.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn pair_heap_fill_from_counts(
+    heap: &mut BinaryHeap<PairHeapEntry>,
+    pair_counts: &HashMap<(Vec<u8>, Vec<u8>), usize>,
+) {
+    heap.clear();
+    for (pair, &count) in pair_counts {
+        if count > 0 {
+            heap.push(PairHeapEntry {
+                count,
+                pair: pair.clone(),
+            });
+        }
+    }
+}
+
+fn load_all_words_from_chunks(
+    chunk_files: &[PathBuf],
+) -> Result<Vec<Vec<Vec<u8>>>, Box<dyn std::error::Error>> {
+    let mut all = Vec::new();
+    for path in chunk_files {
+        let chunk = WordsChunk::load(path)?;
+        all.extend(chunk.words);
+    }
+    Ok(all)
+}
+
+fn remove_chunk_files(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+    for p in paths {
+        if p.exists() {
+            std::fs::remove_file(p)?;
+        }
+    }
+    Ok(())
+}
 
 /// 与 Python `llm_from_scratch` 子 logger 对齐，以便 CLI 配置的 file handler 能收到 Rust 侧日志。
 const LOG_PRETOKENIZE: &str = "llm_from_scratch.bpe_core.pretokenize";
@@ -345,12 +446,12 @@ impl BPETrainer {
             self.vocab_size,
             self.num_workers
         );
-        let chunk_files = self.streaming_pretokenize(input_path)?;
-        let total_chunk_bytes = sum_chunk_disk_bytes(&chunk_files);
+        let mut chunk_paths = self.streaming_pretokenize(input_path)?;
+        let total_chunk_bytes = sum_chunk_disk_bytes(&chunk_paths);
         info!(
             target: LOG_TRAINER,
             "pretokenize finished chunk_files={} total_chunk_on_disk={:.2}MiB ({} bytes)",
-            chunk_files.len(),
+            chunk_paths.len(),
             mib_u64(total_chunk_bytes),
             total_chunk_bytes
         );
@@ -373,10 +474,10 @@ impl BPETrainer {
         info!(
             target: LOG_MERGE,
             "counting initial pair frequencies ({} chunks, parallel)...",
-            chunk_files.len()
+            chunk_paths.len()
         );
         let count_t0 = Instant::now();
-        let mut pair_counts = self.count_pairs_from_chunks(&chunk_files)?;
+        let mut pair_counts = self.count_pairs_from_chunks(&chunk_paths)?;
         let count_wall = count_t0.elapsed().as_secs_f64().max(1e-9);
         let count_chunk_mib_s = mib_u64(total_chunk_bytes) / count_wall;
         info!(
@@ -385,12 +486,16 @@ impl BPETrainer {
             pair_counts.len(),
             count_wall,
             count_chunk_mib_s,
-            chunk_files.len()
+            chunk_paths.len()
         );
 
-        // 4. 迭代 merge
+        // 4. 迭代 merge：第 1 步读写 chunk；若还有后续步，则加载内存、删 chunk、建倒排索引，之后不再扫盘
         let merge_loop_t0 = Instant::now();
         let mut last_merge_log = merge_loop_t0;
+        let mut pair_heap: BinaryHeap<PairHeapEntry> = BinaryHeap::new();
+        let mut mem_words: Option<Vec<Vec<Vec<u8>>>> = None;
+        let mut mem_pair_index: Option<FxHashMap<(Vec<u8>, Vec<u8>), FxHashSet<usize>>> = None;
+
         for merge_idx in 0..num_merges {
             if pair_counts.is_empty() {
                 info!(
@@ -401,10 +506,19 @@ impl BPETrainer {
                 break;
             }
 
-            // 选择最佳 pair
-            let (left, right) = match self.pick_best_pair(&pair_counts) {
-                Some(pair) => pair,
-                None => break,
+            let use_index = mem_words.is_some() && mem_pair_index.is_some();
+
+            // 选择最佳 pair：首步或尚未切到索引模式时用 HashMap；索引模式下用大顶堆 + 惰性校验
+            let (left, right) = if use_index {
+                match pair_heap_pop_best(&mut pair_heap, &pair_counts) {
+                    Some(pair) => pair,
+                    None => break,
+                }
+            } else {
+                match self.pick_best_pair(&pair_counts) {
+                    Some(pair) => pair,
+                    None => break,
+                }
             };
 
             let freq = pair_counts[&(left.clone(), right.clone())];
@@ -418,18 +532,49 @@ impl BPETrainer {
             let step = merge_idx + 1;
 
             let merge_step_t0 = Instant::now();
-            let delta = self.merge_pair_in_chunks(&chunk_files, &left, &right, &merged)?;
+            let delta = if use_index {
+                merge_global_pair_with_index(
+                    mem_words.as_mut().unwrap(),
+                    mem_pair_index.as_mut().unwrap(),
+                    &left,
+                    &right,
+                    &merged,
+                )
+            } else {
+                self.merge_pair_in_chunks(&chunk_paths, &left, &right, &merged)?
+            };
             let step_merge_wall = merge_step_t0.elapsed().as_secs_f64().max(1e-9);
-            let chunk_throughput_mib_s = mib_u64(total_chunk_bytes) / step_merge_wall;
+            let chunk_throughput_mib_s = if use_index {
+                0.0
+            } else {
+                mib_u64(total_chunk_bytes) / step_merge_wall
+            };
 
             // 更新 pair_counts
             pair_counts.remove(&(left, right));
-            for (pair, change) in delta {
+            for (pair, change) in &delta {
                 let count = pair_counts.entry(pair.clone()).or_insert(0);
                 *count = (*count as i32 + change).max(0) as usize;
                 if *count == 0 {
-                    pair_counts.remove(&pair);
+                    pair_counts.remove(pair);
                 }
+            }
+
+            if merge_idx == 0 && num_merges > 1 {
+                let words = load_all_words_from_chunks(&chunk_paths)?;
+                remove_chunk_files(&chunk_paths)?;
+                chunk_paths.clear();
+                let idx = build_pair_index(&words);
+                pair_heap_fill_from_counts(&mut pair_heap, &pair_counts);
+                mem_words = Some(words);
+                mem_pair_index = Some(idx);
+                info!(
+                    target: LOG_MERGE,
+                    "loaded all words into memory, removed chunk files, built inverted index (distinct_pairs={}) — subsequent merges will not read chunk files",
+                    pair_counts.len()
+                );
+            } else if use_index {
+                pair_heap_push_delta(&mut pair_heap, &delta, &pair_counts);
             }
 
             let elapsed = merge_loop_t0.elapsed().as_secs_f64().max(1e-9);
@@ -450,9 +595,10 @@ impl BPETrainer {
             if log_step {
                 last_merge_log = Instant::now();
                 let step_merge_rate = 1.0 / step_merge_wall;
+                let chunks_on_disk = chunk_paths.len();
                 info!(
                     target: LOG_MERGE,
-                    "merge progress: {}/{} ({:.1}%) {:.2} merges/s(cum) ETA≈{} step_wall={:.3}s step_merge_rate={:.2}/s chunk_throughput={:.2}MiB/s ({} chunks, {:.2}MiB on disk) freq={} distinct_pairs={} new_token_id={}",
+                    "merge progress: {}/{} ({:.1}%) {:.2} merges/s(cum) ETA≈{} step_wall={:.3}s step_merge_rate={:.2}/s chunk_throughput={:.2}MiB/s ({} chunks, {:.2}MiB on disk) inverted_index={} freq={} distinct_pairs={} new_token_id={}",
                     step,
                     num_merges,
                     pct,
@@ -461,8 +607,9 @@ impl BPETrainer {
                     step_merge_wall,
                     step_merge_rate,
                     chunk_throughput_mib_s,
-                    chunk_files.len(),
+                    chunks_on_disk,
                     mib_u64(total_chunk_bytes),
+                    use_index,
                     freq,
                     pair_counts.len(),
                     new_token_id
